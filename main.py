@@ -1,86 +1,23 @@
-import os
-import time
-import requests
-
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
-CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
-
-TIMEFRAME = "15"          # Рабочий таймфрейм (15 минут)
-LOOKBACK_CANDLES = 20     # Количество свечей для определения локального экстремума
-VOLUME_MULTIPLIER = 1.3   # Объем на свече пробоя должен быть на 30% выше среднего
-MIN_TURNOVER_24H = 10_000  # Фильтр ликвидности (от $10M оборота за сутки)
-
-session = requests.Session()
-notified_events = set()  # Защита от дублей: (symbol, candle_timestamp, direction)
-
-def send_tg(text: str):
-    if not TELEGRAM_BOT_TOKEN:
-        print(text)
-        return
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    try:
-        session.post(url, json=payload, timeout=5)
-    except Exception as e:
-        print(f"Ошибка отправки Telegram: {e}")
-
-def get_active_symbols():
-    """Получаем список активных бессрочных фьючерсов с хорошей ликвидностью"""
-    url = "https://api.bybit.com/v5/market/tickers?category=linear"
-    try:
-        res = session.get(url, timeout=10).json()
-        if res.get("retCode") == 0:
-            return [
-                item["symbol"] for item in res["result"]["list"]
-                if item["symbol"].endswith("USDT") and float(item.get("turnover24h", 0)) >= MIN_TURNOVER_24H
-            ]
-    except Exception as e:
-        print(f"Ошибка загрузки тикеров: {e}")
-    return []
-
-def get_klines(symbol: str, limit: int = 25):
-    """Запрашивает последние закрытые свечи"""
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": TIMEFRAME,
-        "limit": limit
-    }
-    try:
-        res = session.get(url, params=params, timeout=5).json()
-        if res.get("retCode") == 0 and res["result"]["list"]:
-            raw_list = res["result"]["list"]
-            # Bybit возвращает от новых к старым. Срез [1:] берет только ЗАКРЫТЫЕ свечи (исключая текущую формирующуюся [0])
-            candles = []
-            for k in reversed(raw_list[1:limit]):
-                candles.append({
-                    "start": int(k[0]),
-                    "open": float(k[1]),
-                    "high": float(k[2]),
-                    "low": float(k[3]),
-                    "close": float(k[4]),
-                    "volume": float(k[5])
-                })
-            return candles
-    except Exception:
-        pass
-    return []
+# --- ОБНОВЛЕННЫЕ ПАРАМЕТРЫ ФИЛЬТРАЦИИ ---
+TIMEFRAME = "15"
+LOOKBACK_CANDLES = 60      # Смотрим уровень за последние 15 часов (60 свечей), а не 5
+MIN_SWEEP_PCT = 1.0        # Минимальный вынос за уровень: от 1.0% (отсекает микро-шум 0.2-0.3%)
+MAX_SWEEP_PCT = 5.0        # Если вынос больше 5% — это бешеный памп/слив, в ложный пробой не лезем
+VOLUME_MULTIPLIER = 1.8    # Объем должен быть почти в 2 раза выше среднего (1.8x)
+MIN_TURNOVER_24H = 15_000_000  # Поднимаем планку объема до $15M
 
 def check_false_breakout(symbol: str):
     candles = get_klines(symbol, limit=LOOKBACK_CANDLES + 2)
     if len(candles) < LOOKBACK_CANDLES:
         return
 
-    # Последняя закрытая свеча
     trigger_candle = candles[-1]
     history = candles[:-1]
 
-    # Локальные экстремумы предыдущих баров
+    # Локальные хай и лоу за 15 часов
     range_high = max(c["high"] for c in history)
     range_low = min(c["low"] for c in history)
 
-    # Средний объем по истории
     avg_vol = sum(c["volume"] for c in history) / len(history)
 
     c_open = trigger_candle["open"]
@@ -94,65 +31,62 @@ def check_false_breakout(symbol: str):
     if candle_range == 0:
         return
 
-    # --- СЦЕНАРИЙ 1: Медвежий ложный пробой (Свип High -> Потенциальный ШОРТ) ---
+    # --- 1. МЕДВЕЖИЙ ЛОЖНЫЙ ПРОБОЙ (SHORT) ---
     if c_high > range_high and c_close < range_high:
+        sweep_pct = ((c_high - range_high) / range_high) * 100
         upper_wick = c_high - max(c_open, c_close)
-        # Тень сверху должна составлять не менее 40% от всей свечи, объем выше среднего
-        if (upper_wick / candle_range) >= 0.40 and c_vol >= avg_vol * VOLUME_MULTIPLIER:
+        wick_ratio = upper_wick / candle_range
+
+        # Фильтры:
+        # 1. Вынос от 1% до 5%
+        # 2. Тень сверху >= 50% всей свечи
+        # 3. Закрытие строго КРАСНОЙ свечой (давление продавца)
+        # 4. Всплеск объема от 1.8x
+        if (MIN_SWEEP_PCT <= sweep_pct <= MAX_SWEEP_PCT and 
+            wick_ratio >= 0.50 and 
+            c_close < c_open and 
+            c_vol >= avg_vol * VOLUME_MULTIPLIER):
+
             event_key = (symbol, c_time, "BEARISH")
             if event_key not in notified_events:
                 notified_events.add(event_key)
                 send_tg(
-                    f"🪤 <b>ЛОЖНЫЙ ПРОБОЙ ХАЯ (SHORT): {symbol}</b>\n\n"
-                    f"• Пробитый уровень High: <code>{range_high}</code>\n"
-                    f"• Тень свечи (High): <code>{c_high}</code> (Свип: <code>{((c_high - range_high)/range_high)*100:+.2f}%</code>)\n"
-                    f"• Закрытие свечи: <code>{c_close}</code> (уход под уровень)\n"
-                    f"• Всплеск объема: <code>{c_vol/avg_vol:.1f}x</code> от среднего\n"
-                    f"• ТФ: <code>M{TIMEFRAME}</code>\n\n"
-                    f"💡 <i>Собрана ликвидность на стопах покупателей. Вход при подтверждении на M5.</i>\n"
+                    f"🪤 <b>ЛОЖНЫЙ ВЫНОС ХАЯ (SHORT): {symbol}</b>\n\n"
+                    f"• Уровень (High за 15ч): <code>{range_high}</code>\n"
+                    f"• Вынос тенью: <code>+{sweep_pct:.2f}%</code> (High: <code>{c_high}</code>)\n"
+                    f"• Закрытие: <code>{c_close}</code> (красная свеча)\n"
+                    f"• Доля верхней тени: <code>{wick_ratio * 100:.0f}%</code>\n"
+                    f"• Всплеск объёма: <code>{c_vol/avg_vol:.1f}x</code>\n\n"
                     f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
-                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass TV</a>"
+                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
                 )
 
-    # --- СЦЕНАРИЙ 2: Бычий ложный пробой (Свип Low -> Потенциальный ЛОНГ) ---
+    # --- 2. БЫЧИЙ ЛОЖНЫЙ ПРОБОЙ (LONG) ---
     elif c_low < range_low and c_close > range_low:
+        sweep_pct = ((range_low - c_low) / range_low) * 100
         lower_wick = min(c_open, c_close) - c_low
-        # Тень снизу должна составлять не менее 40% от всей свечи, объем выше среднего
-        if (lower_wick / candle_range) >= 0.40 and c_vol >= avg_vol * VOLUME_MULTIPLIER:
+        wick_ratio = lower_wick / candle_range
+
+        # Фильтры:
+        # 1. Вынос от 1% до 5%
+        # 2. Тень снизу >= 50% всей свечи
+        # 3. Закрытие строго ЗЕЛЕНОЙ свечой (откуп)
+        # 4. Всплеск объема от 1.8x
+        if (MIN_SWEEP_PCT <= sweep_pct <= MAX_SWEEP_PCT and 
+            wick_ratio >= 0.50 and 
+            c_close > c_open and 
+            c_vol >= avg_vol * VOLUME_MULTIPLIER):
+
             event_key = (symbol, c_time, "BULLISH")
             if event_key not in notified_events:
                 notified_events.add(event_key)
                 send_tg(
-                    f"🚀 <b>ЛОЖНЫЙ ПРОБОЙ ЛОЯ (LONG): {symbol}</b>\n\n"
-                    f"• Пробитый уровень Low: <code>{range_low}</code>\n"
-                    f"• Тень свечи (Low): <code>{c_low}</code> (Свип: <code>{((c_low - range_low)/range_low)*100:+.2f}%</code>)\n"
-                    f"• Закрытие свечи: <code>{c_close}</code> (возврат над уровень)\n"
-                    f"• Всплеск объема: <code>{c_vol/avg_vol:.1f}x</code> от среднего\n"
-                    f"• ТФ: <code>M{TIMEFRAME}</code>\n\n"
-                    f"💡 <i>Собрана ликвидность на стопах продавцов. Вход при подтверждении на M5.</i>\n"
+                    f"🚀 <b>ЛОЖНЫЙ ВЫНОС ЛОЯ (LONG): {symbol}</b>\n\n"
+                    f"• Уровень (Low за 15ч): <code>{range_low}</code>\n"
+                    f"• Вынос тенью: <code>-{sweep_pct:.2f}%</code> (Low: <code>{c_low}</code>)\n"
+                    f"• Закрытие: <code>{c_close}</code> (зеленая свеча)\n"
+                    f"• Доля нижней тени: <code>{wick_ratio * 100:.0f}%</code>\n"
+                    f"• Всплеск объёма: <code>{c_vol/avg_vol:.1f}x</code>\n\n"
                     f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
-                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass TV</a>"
+                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
                 )
-
-def main():
-    print("✓ Запуск сканера ложного пробоя...")
-    symbols = get_active_symbols()
-    print(f"Отслеживается {len(symbols)} инструментов.")
-
-    while True:
-        try:
-            for s in symbols:
-                check_false_breakout(s)
-                time.sleep(0.08)  # Лимит запросов Bybit REST API
-            
-            # Очистка старых событий раз в цикл, чтобы память не текла
-            if len(notified_events) > 500:
-                notified_events.clear()
-
-            time.sleep(15)
-        except Exception as e:
-            print(f"Ошибка цикла: {e}")
-            time.sleep(10)
-
-if __name__ == "__main__":
-    main()
