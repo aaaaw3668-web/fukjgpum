@@ -5,9 +5,9 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-TIMEFRAME = "5"          # Рабочий таймфрейм (15 минут)
-LOOKBACK_CANDLES = 10     # Количество свечей для определения локального экстремума
-VOLUME_MULTIPLIER = 1.2   # Объем на свече пробоя должен быть на 30% выше среднего
+TIMEFRAME = "15"          # Рабочий таймфрейм (15 минут)
+LOOKBACK_CANDLES = 20     # Количество свечей для определения локального экстремума
+VOLUME_MULTIPLIER = 1.3   # Объем на свече пробоя должен быть на 30% выше среднего
 MIN_TURNOVER_24H = 10_000  # Фильтр ликвидности (от $10M оборота за сутки)
 
 session = requests.Session()
