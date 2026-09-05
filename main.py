@@ -4,7 +4,7 @@ LOOKBACK_CANDLES = 60      # Смотрим уровень за последни
 MIN_SWEEP_PCT = 1.0        # Минимальный вынос за уровень: от 1.0% (отсекает микро-шум 0.2-0.3%)
 MAX_SWEEP_PCT = 5.0        # Если вынос больше 5% — это бешеный памп/слив, в ложный пробой не лезем
 VOLUME_MULTIPLIER = 1.8    # Объем должен быть почти в 2 раза выше среднего (1.8x)
-MIN_TURNOVER_24H = 15_000_000  # Поднимаем планку объема до $15M
+MIN_TURNOVER_24H = 15_000  # Поднимаем планку объема до $15M
 
 def check_false_breakout(symbol: str):
     candles = get_klines(symbol, limit=LOOKBACK_CANDLES + 2)
