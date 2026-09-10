@@ -2,14 +2,17 @@ import os
 import time
 import requests
 
+# Настройки Telegram
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-TIMEFRAME = "15"               # Опрос по 15-минутным свечам
-OI_FLUSH_THRESHOLD = -5.0      # Минимальный сброс OI за 15 мин (падение от -5% и ниже)
-PRICE_DIP_MIN = -1.5           # Минимальный откат цены вниз (от -1.5%)
-PRICE_DIP_MAX = -6.0           # Если цена упала сильнее -6%, это слом структуры, не лезем
-MIN_TURNOVER_24H = 7_000_000  # Фильтр ликвидности (от $15M)
+# Параметры стратегии Истинного Пробоя
+TIMEFRAME = "15"               # Таймфрейм M15
+LOOKBACK_CANDLES = 48          # База консолидации: 48 свечей (12 часов)
+MIN_BREAK_PCT = 0.8            # Тело должно закрепиться минимум на 0.8% выше/ниже уровня
+MAX_BREAK_PCT = 4.0            # Если свеча улетела на 7-10%, заходить уже поздно (FOMO)
+VOLUME_MULTIPLIER = 2.0        # Объем на свече пробоя должен быть минимум в 2 раза выше среднего
+MIN_TURNOVER_24H = 10_000  # Фильтр ликвидности
 
 session = requests.Session()
 notified_events = set()
@@ -40,90 +43,137 @@ def get_active_symbols():
                 if item["symbol"].endswith("USDT") and float(item.get("turnover24h", 0)) >= MIN_TURNOVER_24H
             ]
     except Exception as e:
-        print(f"Ошибка получения инструментов: {e}")
+        print(f"Ошибка загрузки тикеров: {e}")
     return []
 
-def get_market_data(symbol: str):
-    """
-    Запрашивает последние закрытые свечи и историю изменения открытого интереса (OI)
-    """
-    # 1. Запрос свечей цены
-    kline_url = "https://api.bybit.com/v5/market/kline"
-    k_params = {"category": "linear", "symbol": symbol, "interval": TIMEFRAME, "limit": 25}
-    
-    # 2. Запрос истории OI (интервал 15m)
-    oi_url = "https://api.bybit.com/v5/market/open-interest"
-    oi_params = {"category": "linear", "symbol": symbol, "intervalTime": "15min", "limit": 5}
-
+def get_candles_data(symbol: str):
+    """Сбор свечей с расчетом дельты и накопительного CVD"""
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "limit": LOOKBACK_CANDLES + 2
+    }
     try:
-        k_res = session.get(kline_url, params=k_params, timeout=5).json()
-        oi_res = session.get(oi_url, params=oi_params, timeout=5).json()
+        res = session.get(url, params=params, timeout=5).json()
+        if res.get("retCode") == 0 and res["result"]["list"]:
+            raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_CANDLES + 1]))
+            
+            candles = []
+            cum_delta = 0.0
 
-        if k_res.get("retCode") != 0 or oi_res.get("retCode") != 0:
-            return None
+            for k in raw_candles:
+                c_open = float(k[1])
+                c_high = float(k[2])
+                c_low = float(k[3])
+                c_close = float(k[4])
+                c_vol = float(k[5])
 
-        k_list = k_res["result"]["list"]
-        oi_list = oi_res["result"]["list"]
+                c_range = c_high - c_low
+                delta = (c_vol * ((c_close - c_open) / c_range)) if c_range > 0 else 0.0
+                cum_delta += delta
 
-        if len(k_list) < 20 or len(oi_list) < 2:
-            return None
-
-        # Исключаем формирующуюся свечу [0], берем последнюю закрытую [1] и историю
-        trigger_candle = k_list[1]
-        candles_history = list(reversed(k_list[1:21]))
-
-        # OI Bybit: список идет от новых к старым. [0] - текущий, [1] - 15 мин назад
-        current_oi = float(oi_list[0]["openInterest"])
-        prev_oi = float(oi_list[1]["openInterest"])
-
-        return {
-            "time": int(trigger_candle[0]),
-            "open": float(trigger_candle[1]),
-            "high": float(trigger_candle[2]),
-            "low": float(trigger_candle[3]),
-            "close": float(trigger_candle[4]),
-            "current_oi": current_oi,
-            "prev_oi": prev_oi,
-            "history_closes": [float(c[4]) for c in candles_history]
-        }
+                candles.append({
+                    "time": int(k[0]),
+                    "open": c_open,
+                    "high": c_high,
+                    "low": c_low,
+                    "close": c_close,
+                    "volume": c_vol,
+                    "delta": delta,
+                    "cvd": cum_delta
+                })
+            return candles
     except Exception:
-        return None
+        pass
+    return []
 
-def check_oi_flush(symbol: str):
-    data = get_market_data(symbol)
-    if not data:
+def scan_real_breakout(symbol: str):
+    candles = get_candles_data(symbol)
+    if not candles or len(candles) < LOOKBACK_CANDLES:
         return
 
-    # 1. Расчет изменения Открытого Интереса (OI) за 15 минут
-    if data["prev_oi"] == 0:
+    trigger = candles[-1]
+    history = candles[:-1]
+
+    range_high = max(c["high"] for c in history)
+    range_low = min(c["low"] for c in history)
+    max_history_cvd = max(c["cvd"] for c in history)
+    min_history_cvd = min(c["cvd"] for c in history)
+    avg_vol = sum(c["volume"] for c in history) / len(history)
+
+    c_range = trigger["high"] - trigger["low"]
+    if c_range == 0:
         return
-    oi_change_pct = ((data["current_oi"] - data["prev_oi"]) / data["prev_oi"]) * 100
 
-    # 2. Расчет изменения цены на закрытой свече
-    price_change_pct = ((data["close"] - data["open"]) / data["open"]) * 100
+    # --- 1. ИСТИННЫЙ ПРОБОЙ ВВЕРХ (LONG MOMENTUM) ---
+    # Условия:
+    # 1. Свеча закрылась СТРОГО выше уровня High базы
+    # 2. Пробой тела от 0.8% до 4.0%
+    # 3. Закрытие полнотелое зеленое (Close > Open)
+    # 4. Верхняя тень маленькая (<= 25% свечи) — продавцы не смогли сопротивляться
+    # 5. Объем в 2x выше среднего
+    # 6. CVD CONFIRMATION: Кумулятивная дельта пробила свой 12-часовой максимум!
+    if trigger["close"] > range_high:
+        break_pct = ((trigger["close"] - range_high) / range_high) * 100
+        upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
+        wick_ratio = upper_wick / c_range
 
-    # 3. Фильтр тренда (SMA 20 свечей): ищем сбросы лонгистов только в восходящем тренде
-    sma_20 = sum(data["history_closes"]) / len(data["history_closes"])
-    is_uptrend = data["close"] > sma_20
+        if (MIN_BREAK_PCT <= break_pct <= MAX_BREAK_PCT and
+            trigger["close"] > trigger["open"] and
+            wick_ratio <= 0.25 and
+            trigger["volume"] >= avg_vol * VOLUME_MULTIPLIER and
+            trigger["cvd"] > max_history_cvd):
 
-    # УСЛОВИЕ СЕТАПА:
-    # - Восходящий тренд (цена выше средней за 5 часов)
-    # - Резкий откат цены вниз (от -1.5% до -6.0%)
-    # - Жесткий сброс позиций (OI упал сильнее чем на -5%)
-    if is_uptrend and (PRICE_DIP_MAX <= price_change_pct <= PRICE_DIP_MIN) and (oi_change_pct <= OI_FLUSH_THRESHOLD):
-        event_key = (symbol, data["time"], "OI_FLUSH_LONG")
-        if event_key not in notified_events:
-            notified_events.add(event_key)
-            send_tg(
-                f"🧹 <b>СБРОС ЛИКВИДАЦИЙ ПО ТРЕНДУ (LONG): {symbol}</b>\n\n"
-                f"• Падение OI за 15м: <code>{oi_change_pct:.2f}%</code> (смыли плечи)\n"
-                f"• Откат цены: <code>{price_change_pct:.2f}%</code>\n"
-                f"• Текущая цена: <code>{data['close']}</code> (выше SMA-20: <code>{sma_20:.4f}</code>)\n"
-                f"• ТФ: <code>M{TIMEFRAME}</code>\n\n"
-                f"💡 <i>Лишние лонги ликвидированы. Ждем остановку падения на M5 для входа в продолжение тренда.</i>\n"
-                f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
-                f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass OI</a>"
-            )
+            event_key = (symbol, trigger["time"], "REAL_BREAK_BULL")
+            if event_key not in notified_events:
+                notified_events.add(event_key)
+                send_tg(
+                    f"🚀 <b>ИСТИННЫЙ ПРОБОЙ ХАЯ (LONG): {symbol}</b>\n\n"
+                    f"• Пробитый уровень High: <code>{range_high}</code>\n"
+                    f"• Закрытие свечи: <code>{trigger['close']}</code> (Закрепление: <code>+{break_pct:.2f}%</code>)\n"
+                    f"• Верхняя тень: всего <code>{wick_ratio*100:.0f}%</code> (нет сопротивления продавца)\n"
+                    f"• Всплеск объёма: <code>{trigger['volume']/avg_vol:.1f}x</code> от среднего\n"
+                    f"• <b>CVD рекорд:</b> агрессивные маркет-покупки вынесли стакан\n\n"
+                    f"💡 <i>Вход: на ретесте пробитого уровня {range_high} на M5 или по рынку. Стоп под {range_high}.</i>\n"
+                    f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
+                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
+                )
+
+    # --- 2. ИСТИННЫЙ ПРОБОЙ ВНИЗ (SHORT MOMENTUM) ---
+    # Условия:
+    # 1. Свеча закрылась СТРОГО ниже уровня Low базы
+    # 2. Пробой тела от 0.8% до 4.0%
+    # 3. Закрытие полнотелое красное (Close < Open)
+    # 4. Нижняя тень маленькая (<= 25% свечи) — покупатели не откупают
+    # 5. Объем в 2x выше среднего
+    # 6. CVD CONFIRMATION: Кумулятивная дельта пробила свой 12-часовой минимум!
+    elif trigger["close"] < range_low:
+        break_pct = ((range_low - trigger["close"]) / range_low) * 100
+        lower_wick = min(trigger["open"], trigger["close"]) - trigger["low"]
+        wick_ratio = lower_wick / c_range
+
+        if (MIN_BREAK_PCT <= break_pct <= MAX_BREAK_PCT and
+            trigger["close"] < trigger["open"] and
+            wick_ratio <= 0.25 and
+            trigger["volume"] >= avg_vol * VOLUME_MULTIPLIER and
+            trigger["cvd"] < min_history_cvd):
+
+            event_key = (symbol, trigger["time"], "REAL_BREAK_BEAR")
+            if event_key not in notified_events:
+                notified_events.add(event_key)
+                send_tg(
+                    f"💥 <b>ИСТИННЫЙ ПРОБОЙ ЛОЯ (SHORT): {symbol}</b>\n\n"
+                    f"• Пробитый уровень Low: <code>{range_low}</code>\n"
+                    f"• Закрытие свечи: <code>{trigger['close']}</code> (Закрепление: <code>-{break_pct:.2f}%</code>)\n"
+                    f"• Нижняя тень: всего <code>{wick_ratio*100:.0f}%</code> (нет откупа покупателя)\n"
+                    f"• Всплеск объёма: <code>{trigger['volume']/avg_vol:.1f}x</code> от среднего\n"
+                    f"• <b>CVD рекорд:</b> шквал маркет-продаж пробил поддержки\n\n"
+                    f"💡 <i>Вход: на ретесте пробитого уровня {range_low} на M5 или по рынку. Стоп над {range_low}.</i>\n"
+                    f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
+                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
+                )
 
 def wait_for_m15_close():
     now = time.time()
@@ -132,20 +182,20 @@ def wait_for_m15_close():
     time.sleep(sleep_time)
 
 def main():
-    print("✓ Запуск скринера OI Flush (Ликвидационный сброс по тренду)...")
+    print("✓ Запуск скринера истинных пробоев (Real Breakout + CVD Fuel)...")
     symbols = get_active_symbols()
     print(f"Отслеживается {len(symbols)} инструментов.")
 
     while True:
         try:
             wait_for_m15_close()
-            print(f"[{time.strftime('%H:%M:%S')}] Свеча закрылась. Сканирование сбросов OI...")
+            print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Проверка импульсов...")
 
             for s in symbols:
-                check_oi_flush(s)
-                time.sleep(0.06)
+                scan_real_breakout(s)
+                time.sleep(0.05)
 
-            if len(notified_events) > 200:
+            if len(notified_events) > 300:
                 notified_events.clear()
 
         except Exception as e:
