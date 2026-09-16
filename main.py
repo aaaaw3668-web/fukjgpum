@@ -2,22 +2,20 @@ import os
 import time
 import requests
 
-# --- НАСТРОЙКИ TELEGRAM ---
+# Настройки Telegram
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-# --- ПАРАМЕТРЫ СТАРШЕГО ТАЙМФРЕЙМА (H1) ---
-TIMEFRAME_H1 = "60"           # Часовые свечи на Bybit V5
-LOOKBACK_H1 = 12              # 24 свечи (суточный экстремум / 24 часа истории)
-MIN_BREAK_PCT_H1 = 0.8        # Минимальный вынос хая (от 0.8%)
-MAX_BREAK_PCT_H1 = 5.0        # Максимальный вынос хая (если выше — бешеный туземун, не лезем)
-VOL_MULT_H1 = 2.0             # Всплеск объема на H1 (в 2 раза выше среднего)
-MIN_TURNOVER_24H = 10_000 # Фильтр ликвидности (суточный оборот от $10M)
+# Параметры M15 (Детект кульминации покупок)
+LOOKBACK_M15 = 48             # База консолидации: 12 часов
+MIN_BREAK_PCT_M15 = 0.8       # Пробой от 0.8%
+MAX_BREAK_PCT_M15 = 5.0       # Верхний порог для адекватного соотношения риск/прибыль
+VOL_MULT_M15 = 2.0            # Объем свечи M15 в 2 раза выше среднего
+MIN_TURNOVER_24H = 10_000_000 # Фильтр суточного объема ($10M)
 
-# --- ПАРАМЕТРЫ МЛАДШЕГО ТАЙМФРЕЙМА (M1) ---
-M1_WATCH_EXPIRE_SEC = 120 * 60  # Следить за монетой на M1 в течение 120 минут после закрытия H1
-M1_VOLUME_MULT = 1.5            # Объем на минутной свече слома (в 1.5 раза выше среднего M1)
-SWING_LOW_BARS_M1 = 5           # Количество баров для поиска локального свингового минимума
+# Параметры M1 (Детект CHoCH)
+M1_WATCH_EXPIRE_SEC = 45 * 60 # Сколько следить за монетой после M15 (45 минут)
+M1_VOLUME_MULT = 1.5          # Объем на минутной свече слома (1.5x выше среднего M1)
 
 session = requests.Session()
 # Список наблюдения: { symbol: {"pump_high": float, "break_level": float, "added_at": float} }
@@ -50,40 +48,26 @@ def get_active_symbols():
                 if item["symbol"].endswith("USDT") and float(item.get("turnover24h", 0)) >= MIN_TURNOVER_24H
             ]
     except Exception as e:
-        print(f"Ошибка получения списка тикеров: {e}")
+        print(f"Ошибка тикеров: {e}")
     return []
 
-def get_h1_data(symbol: str):
-    """Сбор часовых свечей с расчетом дельты и кумулятивного CVD"""
+def get_m15_data(symbol: str):
     url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": TIMEFRAME_H1,
-        "limit": LOOKBACK_H1 + 2
-    }
+    params = {"category": "linear", "symbol": symbol, "interval": "15", "limit": LOOKBACK_M15 + 2}
     try:
         res = session.get(url, params=params, timeout=5).json()
         if res.get("retCode") == 0 and res["result"]["list"]:
-            # Исключаем индекс 0 (текущая незакрытая свеча), берем закрытые бары
-            raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_H1 + 1]))
+            raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_M15 + 1]))
             candles = []
             cum_delta = 0.0
-
             for k in raw_candles:
                 c_open, c_high, c_low, c_close, c_vol = map(float, k[1:6])
                 c_range = c_high - c_low
                 delta = (c_vol * ((c_close - c_open) / c_range)) if c_range > 0 else 0.0
                 cum_delta += delta
-
                 candles.append({
-                    "time": int(k[0]),
-                    "open": c_open,
-                    "high": c_high,
-                    "low": c_low,
-                    "close": c_close,
-                    "volume": c_vol,
-                    "cvd": cum_delta
+                    "time": int(k[0]), "open": c_open, "high": c_high,
+                    "low": c_low, "close": c_close, "volume": c_vol, "cvd": cum_delta
                 })
             return candles
     except Exception:
@@ -91,41 +75,31 @@ def get_h1_data(symbol: str):
     return []
 
 def get_m1_candles(symbol: str, limit: int = 20):
-    """Сбор закрытых минутных свечей"""
     url = "https://api.bybit.com/v5/market/kline"
-    params = {
-        "category": "linear",
-        "symbol": symbol,
-        "interval": "1",
-        "limit": limit + 1
-    }
+    params = {"category": "linear", "symbol": symbol, "interval": "1", "limit": limit + 1}
     try:
         res = session.get(url, params=params, timeout=5).json()
         if res.get("retCode") == 0 and res["result"]["list"]:
+            # Исключаем текущую открытую [0]
             raw = list(reversed(res["result"]["list"][1:limit + 1]))
             return [{
-                "time": int(k[0]),
-                "open": float(k[1]),
-                "high": float(k[2]),
-                "low": float(k[3]),
-                "close": float(k[4]),
-                "volume": float(k[5])
+                "time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
+                "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])
             } for k in raw]
     except Exception:
         pass
     return []
 
-def check_h1_candidates(symbols):
-    """Проверяет пробой суточного хая на H1 и ставит монету на карантин в Watchlist"""
-    print(f"[{time.strftime('%H:%M:%S')}] Свеча H1 закрылась. Сканирование выносов суточного хая...")
+def check_m15_candidates(symbols):
+    """Шаг 1: Ищет импульсный пробой на M15 и заносит в Watchlist без отправки в TG"""
+    print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Поиск кандидатов на кульминацию...")
     for symbol in symbols:
-        candles = get_h1_data(symbol)
-        if not candles or len(candles) < LOOKBACK_H1:
+        candles = get_m15_data(symbol)
+        if not candles or len(candles) < LOOKBACK_M15:
             continue
 
         trigger = candles[-1]
         history = candles[:-1]
-
         range_high = max(c["high"] for c in history)
         max_history_cvd = max(c["cvd"] for c in history)
         avg_vol = sum(c["volume"] for c in history) / len(history)
@@ -134,22 +108,16 @@ def check_h1_candidates(symbols):
         if c_range == 0:
             continue
 
-        # Условия кульминации покупок на часовике:
-        # 1. Свеча закрылась выше суточного хая
-        # 2. Вынос тела от 0.8% до 5.0%
-        # 3. Закрытие полнотелое зеленое
-        # 4. Верхняя тень маленькая (<= 25%) — толпа давила до конца часа
-        # 5. Объем H1 в 2x выше среднего
-        # 6. Рекордный всплеск CVD
+        # Условия кульминации покупок (лонг-пробоя) на M15
         if trigger["close"] > range_high:
             break_pct = ((trigger["close"] - range_high) / range_high) * 100
             upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
             wick_ratio = upper_wick / c_range
 
-            if (MIN_BREAK_PCT_H1 <= break_pct <= MAX_BREAK_PCT_H1 and
+            if (MIN_BREAK_PCT_M15 <= break_pct <= MAX_BREAK_PCT_M15 and
                 trigger["close"] > trigger["open"] and
                 wick_ratio <= 0.25 and
-                trigger["volume"] >= avg_vol * VOL_MULT_H1 and
+                trigger["volume"] >= avg_vol * VOL_MULT_M15 and
                 trigger["cvd"] > max_history_cvd):
 
                 watchlist[symbol] = {
@@ -157,17 +125,16 @@ def check_h1_candidates(symbols):
                     "break_level": range_high,
                     "added_at": time.time()
                 }
-                print(f"👀 {symbol} добавлен в Watchlist! (Суточный High: {range_high}, Пик: {trigger['high']})")
-        
+                print(f"👀 {symbol} добавлен в Watchlist (High пампа: {trigger['high']})")
         time.sleep(0.04)
 
 def check_m1_choch():
-    """Мониторит кандидатов из Watchlist на M1 в поисках слома структуры (CHoCH) на объеме"""
+    """Шаг 2: Мониторит монеты из Watchlist на M1 в поисках CHoCH на объеме"""
     now = time.time()
     symbols_to_remove = []
 
     for symbol, info in list(watchlist.items()):
-        # Если за 2 часа слом так и не произошел — удаляем монету
+        # Удаляем монеты, если прошло больше 45 минут
         if now - info["added_at"] > M1_WATCH_EXPIRE_SEC:
             symbols_to_remove.append(symbol)
             continue
@@ -179,23 +146,23 @@ def check_m1_choch():
         trigger_m1 = m1_bars[-1]
         history_m1 = m1_bars[:-1]
 
-        # Подтягиваем пик пампа, если цена продолжает обновлять High
+        # Обновляем хай пампа, если монета все еще ползет вверх
         if trigger_m1["high"] > info["pump_high"]:
             info["pump_high"] = trigger_m1["high"]
 
-        # Находим локальный свинговый минимум последних N минутных свечей
-        swing_low = min(b["low"] for b in history_m1[-SWING_LOW_BARS_M1:])
+        # Находим локальный свинговый минимум последних 5 минутных свечей
+        swing_low = min(b["low"] for b in history_m1[-5:])
         avg_m1_vol = sum(b["volume"] for b in history_m1) / len(history_m1)
 
-        # КРИТЕРИИ СЛОМА СТРУКТУРЫ (CHoCH) НА M1:
+        # УСЛОВИЕ CHoCH НА M1:
         # 1. Свеча закрылась КРАСНОЙ (Close < Open)
-        # 2. Свеча телом пробила свинговый минимум (Close < swing_low)
-        # 3. Всплеск объема на минутном баре слома в 1.5+ раза
+        # 2. Свеча телом закрылась НИЖЕ свингового минимума (пробой структуры)
+        # 3. Объем свечи пробоя CHoCH выше среднего в 1.5+ раза
         if (trigger_m1["close"] < swing_low and 
             trigger_m1["close"] < trigger_m1["open"] and 
             trigger_m1["volume"] >= avg_m1_vol * M1_VOLUME_MULT):
 
-            event_key = (symbol, trigger_m1["time"], "H1_BREAK_M1_CHOCH")
+            event_key = (symbol, trigger_m1["time"], "M1_CHOCH")
             if event_key not in notified_events:
                 notified_events.add(event_key)
                 stop_loss = info["pump_high"]
@@ -203,18 +170,17 @@ def check_m1_choch():
                 stop_distance_pct = ((stop_loss - curr_price) / curr_price) * 100
 
                 send_tg(
-                    f"🎯 <b>РАЗГРУЗКА ПОСЛЕ ВЫНОСА H1: СЛОМ СТРУКТУРЫ (SHORT)</b>\n\n"
-                    f"🪙 <b>Монета:</b> <code>{symbol}</code>\n"
-                    f"• Пробит суточный уровень High (H1): <code>{info['break_level']}</code>\n"
+                    f"⚡ <b>СЛОМ СТРУКТУРЫ (CHoCH M1) ПОСЛЕ ПАМПА: {symbol}</b>\n\n"
                     f"• Пробит свинговый Low (M1): <code>{swing_low}</code>\n"
-                    f"• Текущая цена (Вход): <code>{curr_price}</code>\n"
-                    f"• <b>Объём на сломе M1:</b> <code>{trigger_m1['volume']/avg_m1_vol:.1f}x</code> от среднего\n"
-                    f"• <b>Пик пампа (Стоп-лосс):</b> <code>{stop_loss}</code> (риск: <code>{stop_distance_pct:.2f}%</code>)\n"
-                    f"• <b>Тейк-профит:</b> фиксированные <b>+2.0%</b> от входа\n\n"
-                    f"💡 <i>Толпу заперли в лонгах на часовике. На M1 маркетмейкер отдал инициативу продавцам.</i>\n"
+                    f"• Закрытие M1 со сломом: <code>{curr_price}</code>\n"
+                    f"• <b>Объём на сломе:</b> <code>{trigger_m1['volume']/avg_m1_vol:.1f}x</code> от среднего M1\n"
+                    f"• Пик пампа (Стоп-лосс): <code>{stop_loss}</code> (риск: <code>{stop_distance_pct:.2f}%</code>)\n"
+                    f"• Цель (Тейк): <b>+2.0%</b> от текущей цены\n\n"
+                    f"💡 <i>ММ разгрузился в пробойщиков M15. На M1 подтвержден перехват инициативы продавцами.</i>\n"
                     f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
                     f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
                 )
+                # После выдачи сигнала убираем из активной слежки
                 symbols_to_remove.append(symbol)
 
         time.sleep(0.05)
@@ -223,27 +189,26 @@ def check_m1_choch():
         watchlist.pop(s, None)
 
 def main():
-    print("✓ Запуск скринера (H1 Breakout + M1 CHoCH on Volume)...")
+    print("✓ Запуск двухэтапного скринера (M15 Breakout + M1 CHoCH on Volume)...")
     symbols = get_active_symbols()
-    print(f"Отслеживается {len(symbols)} инструментов с оборотом > ${MIN_TURNOVER_24H/1e6:.0f}M.")
+    print(f"Отслеживается {len(symbols)} инструментов.")
 
-    last_h1_checked = 0
+    last_m15_checked = 0
 
     while True:
         try:
             now = time.time()
 
-            # Проверка H1 раз в 1 час (в первые секунды нового часа)
-            if now - last_h1_checked >= 3600 or (int(now) % 3600 < 10 and now - last_h1_checked > 120):
+            # 1. Проверка M15 каждые 15 минут (:00, :15, :30, :45)
+            if now - last_m15_checked >= 900 or (int(now) % 900 < 5 and now - last_m15_checked > 60):
                 symbols = get_active_symbols()
-                check_h1_candidates(symbols)
-                last_h1_checked = now
+                check_m15_candidates(symbols)
+                last_m15_checked = now
 
-            # Сканирование M1 для монет из Watchlist (каждые 15 секунд)
+            # 2. Проверка M1 для монет из Watchlist (каждые 15–20 секунд)
             if watchlist:
                 check_m1_choch()
 
-            # Очистка старых событий, чтобы не забивать память
             if len(notified_events) > 200:
                 notified_events.clear()
 
