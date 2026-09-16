@@ -15,7 +15,7 @@ MIN_TURNOVER_24H = 10_000 # Фильтр суточного объема ($10M)
 
 # Параметры M1 (Детект CHoCH)
 M1_WATCH_EXPIRE_SEC = 45 * 60 # Сколько следить за монетой после M15 (45 минут)
-M1_VOLUME_MULT = 1.5          # Объем на минутной свече слома (1.5x выше среднего M1)
+M1_VOLUME_MULT = 10          # Объем на минутной свече слома (1.5x выше среднего M1)
 
 session = requests.Session()
 # Список наблюдения: { symbol: {"pump_high": float, "break_level": float, "added_at": float} }
