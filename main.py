@@ -6,21 +6,21 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-# --- ПАРАМЕТРЫ СТАРШЕГО ТАЙМФРЕЙМА (H1) ---
-TIMEFRAME_H1 = "60"           # Часовые свечи на Bybit V5
-LOOKBACK_H1 = 24              # 24 свечи (суточный экстремум / 24 часа истории)
-MIN_BREAK_PCT_H1 = 0.8        # Минимальный вынос хая (от 0.8%)
-MAX_BREAK_PCT_H1 = 5.0        # Максимальный вынос хая (если выше — бешеный туземун, не лезем)
-VOL_MULT_H1 = 2.0             # Всплеск объема на H1 (в 2 раза выше среднего)
-MIN_TURNOVER_24H = 10_000 # Фильтр ликвидности (суточный оборот от $10M)
+# --- ПАРАМЕТРЫ СТАРШЕГО ТАЙМФРЕЙМА (H1: ЛОЖНЫЙ ПРОБОЙ СОПРОТИВЛЕНИЯ) ---
+TIMEFRAME_H1 = "60"           # Часовые свечи Bybit V5
+LOOKBACK_H1 = 24              # 24 свечи (суточная база / 24 часа истории)
+MIN_SWEEP_PCT_H1 = 0.4        # Минимальный прокол сопротивления (от 0.4%)
+MAX_SWEEP_PCT_H1 = 4.0        # Максимальный прокол (если выше — бешеный памп, не трогаем)
+VOL_MULT_H1 = 1.8             # Всплеск объема на H1 (в 1.8x выше среднего)
+MIN_TURNOVER_24H = 10_000_000 # Оборот от $10M (защита от неликвида)
 
-# --- ПАРАМЕТРЫ МЛАДШЕГО ТАЙМФРЕЙМА (M1) ---
-M1_WATCH_EXPIRE_SEC = 120 * 60  # Следить за монетой на M1 в течение 120 минут после закрытия H1
-M1_VOLUME_MULT = 1.5            # Объем на минутной свече слома (в 1.5 раза выше среднего M1)
-SWING_LOW_BARS_M1 = 5           # Количество баров для поиска локального свингового минимума
+# --- ПАРАМЕТРЫ МЛАДШЕГО ТАЙМФРЕЙМА (M1: МЕДВЕЖИЙ СЛОМ CHoCH) ---
+M1_WATCH_EXPIRE_SEC = 120 * 60  # Время наблюдения (до 2 часов после закрытия H1)
+M1_VOLUME_MULT = 1.4            # Всплеск объема на свече слома M1
+SWING_LOW_BARS_M1 = 5           # Количество минутных баров для поиска локального свингового Low
 
 session = requests.Session()
-# Список наблюдения: { symbol: {"pump_high": float, "break_level": float, "added_at": float} }
+# Список наблюдения: { symbol: {"sweep_high": float, "resistance_level": float, "added_at": float} }
 watchlist = {}
 notified_events = set()
 
@@ -65,7 +65,6 @@ def get_h1_data(symbol: str):
     try:
         res = session.get(url, params=params, timeout=5).json()
         if res.get("retCode") == 0 and res["result"]["list"]:
-            # Исключаем индекс 0 (текущая незакрытая свеча), берем закрытые бары
             raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_H1 + 1]))
             candles = []
             cum_delta = 0.0
@@ -115,9 +114,9 @@ def get_m1_candles(symbol: str, limit: int = 20):
         pass
     return []
 
-def check_h1_candidates(symbols):
-    """Проверяет пробой суточного хая на H1 и ставит монету на карантин в Watchlist"""
-    print(f"[{time.strftime('%H:%M:%S')}] Свеча H1 закрылась. Сканирование выносов суточного хая...")
+def check_h1_fake_breakout(symbols):
+    """Шаг 1: Детект ложного выноса часового сопротивления (H1 Resistance Sweep)"""
+    print(f"[{time.strftime('%H:%M:%S')}] Свеча H1 закрыта. Поиск ложных выносов сопротивления...")
     for symbol in symbols:
         candles = get_h1_data(symbol)
         if not candles or len(candles) < LOOKBACK_H1:
@@ -126,48 +125,47 @@ def check_h1_candidates(symbols):
         trigger = candles[-1]
         history = candles[:-1]
 
+        # Находим ключевую линию сопротивления за Lookback
         range_high = max(c["high"] for c in history)
-        max_history_cvd = max(c["cvd"] for c in history)
         avg_vol = sum(c["volume"] for c in history) / len(history)
 
         c_range = trigger["high"] - trigger["low"]
         if c_range == 0:
             continue
 
-        # Условия кульминации покупок на часовике:
-        # 1. Свеча закрылась выше суточного хая
-        # 2. Вынос тела от 0.8% до 5.0%
-        # 3. Закрытие полнотелое зеленое
-        # 4. Верхняя тень маленькая (<= 25%) — толпа давила до конца часа
-        # 5. Объем H1 в 2x выше среднего
-        # 6. Рекордный всплеск CVD
-        if trigger["close"] > range_high:
-            break_pct = ((trigger["close"] - range_high) / range_high) * 100
+        # Прокол сопротивления хаем свечи
+        if trigger["high"] > range_high:
+            sweep_pct = ((trigger["high"] - range_high) / range_high) * 100
             upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
-            wick_ratio = upper_wick / c_range
+            wick_ratio = upper_wick / c_range  # Доля верхнего фитиля от размаха бара
 
-            if (MIN_BREAK_PCT_H1 <= break_pct <= MAX_BREAK_PCT_H1 and
-                trigger["close"] > trigger["open"] and
-                wick_ratio <= 0.25 and
-                trigger["volume"] >= avg_vol * VOL_MULT_H1 and
-                trigger["cvd"] > max_history_cvd):
+            # УСЛОВИЯ ЛОЖНОГО ПРОБОЯ (FAKEOUT RESISTANCE):
+            # 1. Глубина выноса от 0.4% до 4.0%
+            # 2. Цена закрылась ОБРАТНО ПОД сопротивлением ЛИБО оставила длинную тень отката (>= 45%)
+            # 3. Аномальный объем (кульминация покупок толпы)
+            is_closed_below = trigger["close"] <= range_high
+            is_strong_wick = wick_ratio >= 0.45
+
+            if (MIN_SWEEP_PCT_H1 <= sweep_pct <= MAX_SWEEP_PCT_H1 and
+                (is_closed_below or is_strong_wick) and
+                trigger["volume"] >= avg_vol * VOL_MULT_H1):
 
                 watchlist[symbol] = {
-                    "pump_high": trigger["high"],
-                    "break_level": range_high,
+                    "sweep_high": trigger["high"],
+                    "resistance_level": range_high,
                     "added_at": time.time()
                 }
-                print(f"👀 {symbol} добавлен в Watchlist! (Суточный High: {range_high}, Пик: {trigger['high']})")
-        
+                print(f"🧲 Ложный вынос H1 на {symbol}! Сопротивление: {range_high}, Пик сквиза: {trigger['high']}")
+
         time.sleep(0.04)
 
-def check_m1_choch():
-    """Мониторит кандидатов из Watchlist на M1 в поисках слома структуры (CHoCH) на объеме"""
+def check_m1_bearish_choch():
+    """Шаг 2: Поиск медвежьего слома структуры (CHoCH вниз) на M1"""
     now = time.time()
     symbols_to_remove = []
 
     for symbol, info in list(watchlist.items()):
-        # Если за 2 часа слом так и не произошел — удаляем монету
+        # Истек таймаут наблюдения
         if now - info["added_at"] > M1_WATCH_EXPIRE_SEC:
             symbols_to_remove.append(symbol)
             continue
@@ -179,39 +177,39 @@ def check_m1_choch():
         trigger_m1 = m1_bars[-1]
         history_m1 = m1_bars[:-1]
 
-        # Подтягиваем пик пампа, если цена продолжает обновлять High
-        if trigger_m1["high"] > info["pump_high"]:
-            info["pump_high"] = trigger_m1["high"]
+        # Если монета продолжает импульсно обновлять пик — подтягиваем стоп
+        if trigger_m1["high"] > info["sweep_high"]:
+            info["sweep_high"] = trigger_m1["high"]
 
-        # Находим локальный свинговый минимум последних N минутных свечей
+        # Ищем локальный свинговый минимум последних N минутных свечей
         swing_low = min(b["low"] for b in history_m1[-SWING_LOW_BARS_M1:])
         avg_m1_vol = sum(b["volume"] for b in history_m1) / len(history_m1)
 
-        # КРИТЕРИИ СЛОМА СТРУКТУРЫ (CHoCH) НА M1:
-        # 1. Свеча закрылась КРАСНОЙ (Close < Open)
-        # 2. Свеча телом пробила свинговый минимум (Close < swing_low)
-        # 3. Всплеск объема на минутном баре слома в 1.5+ раза
-        if (trigger_m1["close"] < swing_low and 
-            trigger_m1["close"] < trigger_m1["open"] and 
+        # КРИТЕРИИ МЕДВЕЖЬЕГО СЛОМА (BEARISH CHoCH):
+        # 1. Минутная свеча закрылась КРАСНОЙ (Close < Open)
+        # 2. Закрытие строго НИЖЕ свингового минимума (Close < swing_low)
+        # 3. Объем свечи слома в 1.4x выше среднего M1
+        if (trigger_m1["close"] < swing_low and
+            trigger_m1["close"] < trigger_m1["open"] and
             trigger_m1["volume"] >= avg_m1_vol * M1_VOLUME_MULT):
 
-            event_key = (symbol, trigger_m1["time"], "H1_BREAK_M1_CHOCH")
+            event_key = (symbol, trigger_m1["time"], "H1_FAKEOUT_M1_BEAR_CHOCH")
             if event_key not in notified_events:
                 notified_events.add(event_key)
-                stop_loss = info["pump_high"]
+                stop_loss = info["sweep_high"]
                 curr_price = trigger_m1["close"]
                 stop_distance_pct = ((stop_loss - curr_price) / curr_price) * 100
 
                 send_tg(
-                    f"🎯 <b>РАЗГРУЗКА ПОСЛЕ ВЫНОСА H1: СЛОМ СТРУКТУРЫ (SHORT)</b>\n\n"
+                    f"🔴 <b>ЛОЖНЫЙ ПРОБОЙ СОПРОТИВЛЕНИЯ H1: СЛОМ В ШОРТ (CHoCH)</b>\n\n"
                     f"🪙 <b>Монета:</b> <code>{symbol}</code>\n"
-                    f"• Пробит суточный уровень High (H1): <code>{info['break_level']}</code>\n"
+                    f"• Протестировано сопротивление (H1): <code>{info['resistance_level']}</code>\n"
                     f"• Пробит свинговый Low (M1): <code>{swing_low}</code>\n"
-                    f"• Текущая цена (Вход): <code>{curr_price}</code>\n"
-                    f"• <b>Объём на сломе M1:</b> <code>{trigger_m1['volume']/avg_m1_vol:.1f}x</code> от среднего\n"
-                    f"• <b>Пик пампа (Стоп-лосс):</b> <code>{stop_loss}</code> (риск: <code>{stop_distance_pct:.2f}%</code>)\n"
-                    f"• <b>Тейк-профит:</b> фиксированные <b>+2.0%</b> от входа\n\n"
-                    f"💡 <i>Толпу заперли в лонгах на часовике. На M1 маркетмейкер отдал инициативу продавцам.</i>\n"
+                    f"• Текущая цена (Вход SHORT): <code>{curr_price}</code>\n"
+                    f"• <b>Объём слома M1:</b> <code>{trigger_m1['volume']/avg_m1_vol:.1f}x</code>\n"
+                    f"• <b>Пик манипуляции (Стоп-лосс):</b> <code>{stop_loss}</code> (риск: <code>{stop_distance_pct:.2f}%</code>)\n"
+                    f"• <b>Тейк-профит:</b> фиксированные <b>+2.0%</b>\n\n"
+                    f"💡 <i>Маркетмейкер собрал стоп-ликвидность шортистов над уровнем сопротивления H1. На минутке продавцы подтвердили перехват инициативы.</i>\n"
                     f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
                     f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
                 )
@@ -223,7 +221,7 @@ def check_m1_choch():
         watchlist.pop(s, None)
 
 def main():
-    print("✓ Запуск скринера (H1 Breakout + M1 CHoCH on Volume)...")
+    print("✓ Запуск скринера (H1 Fakeout Resistance + M1 Bearish CHoCH)...")
     symbols = get_active_symbols()
     print(f"Отслеживается {len(symbols)} инструментов с оборотом > ${MIN_TURNOVER_24H/1e6:.0f}M.")
 
@@ -233,17 +231,16 @@ def main():
         try:
             now = time.time()
 
-            # Проверка H1 раз в 1 час (в первые секунды нового часа)
+            # Проверка H1 раз в час при закрытии бара (:00 минут)
             if now - last_h1_checked >= 3600 or (int(now) % 3600 < 10 and now - last_h1_checked > 120):
                 symbols = get_active_symbols()
-                check_h1_candidates(symbols)
+                check_h1_fake_breakout(symbols)
                 last_h1_checked = now
 
-            # Сканирование M1 для монет из Watchlist (каждые 15 секунд)
+            # Проверка M1 для кандидатов из списка наблюдения
             if watchlist:
-                check_m1_choch()
+                check_m1_bearish_choch()
 
-            # Очистка старых событий, чтобы не забивать память
             if len(notified_events) > 200:
                 notified_events.clear()
 
