@@ -6,20 +6,15 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-# Параметры M15 (Детект кульминации покупок)
-LOOKBACK_M15 = 48             # База консолидации: 12 часов
-MIN_BREAK_PCT_M15 = 0.8       # Пробой от 0.8%
-MAX_BREAK_PCT_M15 = 5.0       # Верхний порог для адекватного соотношения риск/прибыль
-VOL_MULT_M15 = 2.0            # Объем свечи M15 в 2 раза выше среднего
-MIN_TURNOVER_24H = 10_000 # Фильтр суточного объема ($10M)
-
-# Параметры M1 (Детект CHoCH)
-M1_WATCH_EXPIRE_SEC = 45 * 60 # Сколько следить за монетой после M15 (45 минут)
-M1_VOLUME_MULT = 10          # Объем на минутной свече слома (1.5x выше среднего M1)
+# Параметры стратегии Истинного Пробоя (Short only)
+TIMEFRAME = "15"               # Таймфрейм M15
+LOOKBACK_CANDLES = 48          # База консолидации: 48 свечей (12 часов)
+MIN_BREAK_PCT = 0.8            # Тело должно закрепиться минимум на 0.8% ниже уровня
+MAX_BREAK_PCT = 4.0            # Если свеча улетела на 7-10%, заходить уже поздно (FOMO)
+VOLUME_MULTIPLIER = 2.0        # Объем на свече пробоя должен быть минимум в 2 раза выше среднего
+MIN_TURNOVER_24H = 15_000  # Фильтр ликвидности
 
 session = requests.Session()
-# Список наблюдения: { symbol: {"pump_high": float, "break_level": float, "added_at": float} }
-watchlist = {}
 notified_events = set()
 
 def send_tg(text: str):
@@ -48,174 +43,127 @@ def get_active_symbols():
                 if item["symbol"].endswith("USDT") and float(item.get("turnover24h", 0)) >= MIN_TURNOVER_24H
             ]
     except Exception as e:
-        print(f"Ошибка тикеров: {e}")
+        print(f"Ошибка загрузки тикеров: {e}")
     return []
 
-def get_m15_data(symbol: str):
+def get_candles_data(symbol: str):
+    """Сбор свечей с расчетом дельты и накопительного CVD"""
     url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": "15", "limit": LOOKBACK_M15 + 2}
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "limit": LOOKBACK_CANDLES + 2
+    }
     try:
         res = session.get(url, params=params, timeout=5).json()
         if res.get("retCode") == 0 and res["result"]["list"]:
-            raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_M15 + 1]))
+            raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_CANDLES + 1]))
+            
             candles = []
             cum_delta = 0.0
+
             for k in raw_candles:
-                c_open, c_high, c_low, c_close, c_vol = map(float, k[1:6])
+                c_open = float(k[1])
+                c_high = float(k[2])
+                c_low = float(k[3])
+                c_close = float(k[4])
+                c_vol = float(k[5])
+
                 c_range = c_high - c_low
                 delta = (c_vol * ((c_close - c_open) / c_range)) if c_range > 0 else 0.0
                 cum_delta += delta
+
                 candles.append({
-                    "time": int(k[0]), "open": c_open, "high": c_high,
-                    "low": c_low, "close": c_close, "volume": c_vol, "cvd": cum_delta
+                    "time": int(k[0]),
+                    "open": c_open,
+                    "high": c_high,
+                    "low": c_low,
+                    "close": c_close,
+                    "volume": c_vol,
+                    "delta": delta,
+                    "cvd": cum_delta
                 })
             return candles
     except Exception:
         pass
     return []
 
-def get_m1_candles(symbol: str, limit: int = 20):
-    url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": "1", "limit": limit + 1}
-    try:
-        res = session.get(url, params=params, timeout=5).json()
-        if res.get("retCode") == 0 and res["result"]["list"]:
-            # Исключаем текущую открытую [0]
-            raw = list(reversed(res["result"]["list"][1:limit + 1]))
-            return [{
-                "time": int(k[0]), "open": float(k[1]), "high": float(k[2]),
-                "low": float(k[3]), "close": float(k[4]), "volume": float(k[5])
-            } for k in raw]
-    except Exception:
-        pass
-    return []
+def scan_real_breakout(symbol: str):
+    candles = get_candles_data(symbol)
+    if not candles or len(candles) < LOOKBACK_CANDLES:
+        return
 
-def check_m15_candidates(symbols):
-    """Шаг 1: Ищет импульсный пробой на M15 и заносит в Watchlist без отправки в TG"""
-    print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Поиск кандидатов на кульминацию...")
-    for symbol in symbols:
-        candles = get_m15_data(symbol)
-        if not candles or len(candles) < LOOKBACK_M15:
-            continue
+    trigger = candles[-1]
+    history = candles[:-1]
 
-        trigger = candles[-1]
-        history = candles[:-1]
-        range_high = max(c["high"] for c in history)
-        max_history_cvd = max(c["cvd"] for c in history)
-        avg_vol = sum(c["volume"] for c in history) / len(history)
+    range_low = min(c["low"] for c in history)
+    min_history_cvd = min(c["cvd"] for c in history)
+    avg_vol = sum(c["volume"] for c in history) / len(history)
 
-        c_range = trigger["high"] - trigger["low"]
-        if c_range == 0:
-            continue
+    c_range = trigger["high"] - trigger["low"]
+    if c_range == 0:
+        return
 
-        # Условия кульминации покупок (лонг-пробоя) на M15
-        if trigger["close"] > range_high:
-            break_pct = ((trigger["close"] - range_high) / range_high) * 100
-            upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
-            wick_ratio = upper_wick / c_range
+    # --- ИСТИННЫЙ ПРОБОЙ ВНИЗ (SHORT MOMENTUM) ---
+    # Условия:
+    # 1. Свеча закрылась СТРОГО ниже уровня Low базы
+    # 2. Пробой тела от 0.8% до 4.0%
+    # 3. Закрытие полнотелое красное (Close < Open)
+    # 4. Нижняя тень маленькая (<= 25% свечи) — покупатели не откупают
+    # 5. Объем в 2x выше среднего
+    # 6. CVD CONFIRMATION: Кумулятивная дельта пробила минимум базы
+    if trigger["close"] < range_low:
+        break_pct = ((range_low - trigger["close"]) / range_low) * 100
+        lower_wick = min(trigger["open"], trigger["close"]) - trigger["low"]
+        wick_ratio = lower_wick / c_range
 
-            if (MIN_BREAK_PCT_M15 <= break_pct <= MAX_BREAK_PCT_M15 and
-                trigger["close"] > trigger["open"] and
-                wick_ratio <= 0.25 and
-                trigger["volume"] >= avg_vol * VOL_MULT_M15 and
-                trigger["cvd"] > max_history_cvd):
+        if (MIN_BREAK_PCT <= break_pct <= MAX_BREAK_PCT and
+            trigger["close"] < trigger["open"] and
+            wick_ratio <= 0.25 and
+            trigger["volume"] >= avg_vol * VOLUME_MULTIPLIER and
+            trigger["cvd"] < min_history_cvd):
 
-                watchlist[symbol] = {
-                    "pump_high": trigger["high"],
-                    "break_level": range_high,
-                    "added_at": time.time()
-                }
-                print(f"👀 {symbol} добавлен в Watchlist (High пампа: {trigger['high']})")
-        time.sleep(0.04)
-
-def check_m1_choch():
-    """Шаг 2: Мониторит монеты из Watchlist на M1 в поисках CHoCH на объеме"""
-    now = time.time()
-    symbols_to_remove = []
-
-    for symbol, info in list(watchlist.items()):
-        # Удаляем монеты, если прошло больше 45 минут
-        if now - info["added_at"] > M1_WATCH_EXPIRE_SEC:
-            symbols_to_remove.append(symbol)
-            continue
-
-        m1_bars = get_m1_candles(symbol, limit=15)
-        if not m1_bars or len(m1_bars) < 10:
-            continue
-
-        trigger_m1 = m1_bars[-1]
-        history_m1 = m1_bars[:-1]
-
-        # Обновляем хай пампа, если монета все еще ползет вверх
-        if trigger_m1["high"] > info["pump_high"]:
-            info["pump_high"] = trigger_m1["high"]
-
-        # Находим локальный свинговый минимум последних 5 минутных свечей
-        swing_low = min(b["low"] for b in history_m1[-5:])
-        avg_m1_vol = sum(b["volume"] for b in history_m1) / len(history_m1)
-
-        # УСЛОВИЕ CHoCH НА M1:
-        # 1. Свеча закрылась КРАСНОЙ (Close < Open)
-        # 2. Свеча телом закрылась НИЖЕ свингового минимума (пробой структуры)
-        # 3. Объем свечи пробоя CHoCH выше среднего в 1.5+ раза
-        if (trigger_m1["close"] < swing_low and 
-            trigger_m1["close"] < trigger_m1["open"] and 
-            trigger_m1["volume"] >= avg_m1_vol * M1_VOLUME_MULT):
-
-            event_key = (symbol, trigger_m1["time"], "M1_CHOCH")
+            event_key = (symbol, trigger["time"], "REAL_BREAK_BEAR")
             if event_key not in notified_events:
                 notified_events.add(event_key)
-                stop_loss = info["pump_high"]
-                curr_price = trigger_m1["close"]
-                stop_distance_pct = ((stop_loss - curr_price) / curr_price) * 100
-
                 send_tg(
-                    f"⚡ <b>СЛОМ СТРУКТУРЫ (CHoCH M1) ПОСЛЕ ПАМПА: {symbol}</b>\n\n"
-                    f"• Пробит свинговый Low (M1): <code>{swing_low}</code>\n"
-                    f"• Закрытие M1 со сломом: <code>{curr_price}</code>\n"
-                    f"• <b>Объём на сломе:</b> <code>{trigger_m1['volume']/avg_m1_vol:.1f}x</code> от среднего M1\n"
-                    f"• Пик пампа (Стоп-лосс): <code>{stop_loss}</code> (риск: <code>{stop_distance_pct:.2f}%</code>)\n"
-                    f"• Цель (Тейк): <b>+2.0%</b> от текущей цены\n\n"
-                    f"💡 <i>ММ разгрузился в пробойщиков M15. На M1 подтвержден перехват инициативы продавцами.</i>\n"
+                    f"💥 <b>ИСТИННЫЙ ПРОБОЙ ЛОЯ (SHORT): {symbol}</b>\n\n"
+                    f"• Пробитый уровень Low: <code>{range_low}</code>\n"
+                    f"• Закрытие свечи: <code>{trigger['close']}</code> (Закрепление: <code>-{break_pct:.2f}%</code>)\n"
+                    f"• Нижняя тень: всего <code>{wick_ratio*100:.0f}%</code> (нет откупа покупателя)\n"
+                    f"• Всплеск объёма: <code>{trigger['volume']/avg_vol:.1f}x</code> от среднего\n"
+                    f"• <b>CVD рекорд:</b> шквал маркет-продаж пробил поддержки\n\n"
+                    f"💡 <i>Вход: на ретесте пробитого уровня {range_low} на M5 или по рынку. Стоп над {range_low}.</i>\n"
                     f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
                     f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
                 )
-                # После выдачи сигнала убираем из активной слежки
-                symbols_to_remove.append(symbol)
 
-        time.sleep(0.05)
-
-    for s in symbols_to_remove:
-        watchlist.pop(s, None)
+def wait_for_m15_close():
+    now = time.time()
+    interval = 15 * 60
+    sleep_time = interval - (now % interval) + 3
+    time.sleep(sleep_time)
 
 def main():
-    print("✓ Запуск двухэтапного скринера (M15 Breakout + M1 CHoCH on Volume)...")
+    print("✓ Запуск шорт-скринера истинных пробоев (Real Breakout Low + CVD)...")
     symbols = get_active_symbols()
     print(f"Отслеживается {len(symbols)} инструментов.")
 
-    last_m15_checked = 0
-
     while True:
         try:
-            now = time.time()
+            wait_for_m15_close()
+            print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Проверка импульсов в шорт...")
 
-            # 1. Проверка M15 каждые 15 минут (:00, :15, :30, :45)
-            if now - last_m15_checked >= 900 or (int(now) % 900 < 5 and now - last_m15_checked > 60):
-                symbols = get_active_symbols()
-                check_m15_candidates(symbols)
-                last_m15_checked = now
+            for s in symbols:
+                scan_real_breakout(s)
+                time.sleep(0.05)
 
-            # 2. Проверка M1 для монет из Watchlist (каждые 15–20 секунд)
-            if watchlist:
-                check_m1_choch()
-
-            if len(notified_events) > 200:
+            if len(notified_events) > 300:
                 notified_events.clear()
 
-            time.sleep(15)
-
         except Exception as e:
-            print(f"Ошибка главного цикла: {e}")
+            print(f"Ошибка цикла: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
