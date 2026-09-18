@@ -10,7 +10,7 @@ LOOKBACK_M15 = 48             # Окно анализа: 48 свечей (12 ч�
 MIN_BREAK_PCT_M15 = 0.5       # Минимальный пробой уровня (%)
 MAX_BREAK_PCT_M15 = 4.0       # Максимальный пробой (%)
 VOL_MULT_M15 = 1.5            # Множитель среднего объема
-MIN_TURNOVER_24H = 10_000_000 # Минимальный суточный объем ($10M)
+MIN_TURNOVER_24H = 10_000 # Минимальный суточный объем ($10M)
 
 session = requests.Session()
 notified_events = set()
