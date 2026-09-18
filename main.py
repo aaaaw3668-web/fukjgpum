@@ -2,15 +2,17 @@ import os
 import time
 import requests
 
+# Настройки Telegram
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-# Параметры скринера M15
-LOOKBACK_M15 = 48             # Окно анализа: 48 свечей (12 часов)
-MIN_BREAK_PCT_M15 = 0.5       # Минимальный пробой уровня (%)
-MAX_BREAK_PCT_M15 = 4.0       # Максимальный пробой (%)
-VOL_MULT_M15 = 1.5            # Множитель среднего объема
-MIN_TURNOVER_24H = 10_000 # Минимальный суточный объем ($10M)
+# Параметры стратегии Истинного Пробоя (Short only)
+TIMEFRAME = "15"               # Таймфрейм M15
+LOOKBACK_CANDLES = 48          # База консолидации: 48 свечей (12 часов)
+MIN_BREAK_PCT = 0.8            # Тело должно закрепиться минимум на 0.8% ниже уровня
+MAX_BREAK_PCT = 4.0            # Если свеча улетела на 7-10%, заходить уже поздно (FOMO)
+VOLUME_MULTIPLIER = 2.0        # Объем на свече пробоя должен быть минимум в 2 раза выше среднего
+MIN_TURNOVER_24H = 15_000  # Фильтр ликвидности
 
 session = requests.Session()
 notified_events = set()
@@ -41,27 +43,37 @@ def get_active_symbols():
                 if item["symbol"].endswith("USDT") and float(item.get("turnover24h", 0)) >= MIN_TURNOVER_24H
             ]
     except Exception as e:
-        print(f"Ошибка тикеров: {e}")
+        print(f"Ошибка загрузки тикеров: {e}")
     return []
 
-def get_m15_data(symbol: str):
-    """Получение свечей M15 с расчетом синтетического CVD"""
+def get_candles_data(symbol: str):
+    """Сбор свечей с расчетом дельты и накопительного CVD"""
     url = "https://api.bybit.com/v5/market/kline"
-    params = {"category": "linear", "symbol": symbol, "interval": "15", "limit": LOOKBACK_M15 + 2}
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "interval": TIMEFRAME,
+        "limit": LOOKBACK_CANDLES + 2
+    }
     try:
         res = session.get(url, params=params, timeout=5).json()
         if res.get("retCode") == 0 and res["result"]["list"]:
-            # Исключаем текущую незакрытую свечу (индекс 0) и берем историю
-            raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_M15 + 1]))
+            raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_CANDLES + 1]))
+            
             candles = []
             cum_delta = 0.0
-            
+
             for k in raw_candles:
-                c_open, c_high, c_low, c_close, c_vol = map(float, k[1:6])
+                c_open = float(k[1])
+                c_high = float(k[2])
+                c_low = float(k[3])
+                c_close = float(k[4])
+                c_vol = float(k[5])
+
                 c_range = c_high - c_low
-                # Синтетическая дельта свечи на основе позиционирования закрытия
                 delta = (c_vol * ((c_close - c_open) / c_range)) if c_range > 0 else 0.0
                 cum_delta += delta
+
                 candles.append({
                     "time": int(k[0]),
                     "open": c_open,
@@ -77,84 +89,81 @@ def get_m15_data(symbol: str):
         pass
     return []
 
-def scan_cvd_divergence(symbols):
-    """Поиск пробоя уровня с медвежьей дивергенцией CVD"""
-    print(f"[{time.strftime('%H:%M:%S')}] Сканирование M15 на дивергенцию CVD...")
+def scan_real_breakout(symbol: str):
+    candles = get_candles_data(symbol)
+    if not candles or len(candles) < LOOKBACK_CANDLES:
+        return
 
-    for symbol in symbols:
-        candles = get_m15_data(symbol)
-        if not candles or len(candles) < LOOKBACK_M15:
-            continue
+    trigger = candles[-1]
+    history = candles[:-1]
 
-        trigger = candles[-1]
-        history = candles[:-1]
+    range_low = min(c["low"] for c in history)
+    min_history_cvd = min(c["cvd"] for c in history)
+    avg_vol = sum(c["volume"] for c in history) / len(history)
 
-        range_high = max(c["high"] for c in history)
-        max_history_cvd = max(c["cvd"] for c in history)
-        avg_vol = sum(c["volume"] for c in history) / len(history)
+    c_range = trigger["high"] - trigger["low"]
+    if c_range == 0:
+        return
 
-        c_range = trigger["high"] - trigger["low"]
-        if c_range == 0:
-            continue
+    # --- ИСТИННЫЙ ПРОБОЙ ВНИЗ (SHORT MOMENTUM) ---
+    # Условия:
+    # 1. Свеча закрылась СТРОГО ниже уровня Low базы
+    # 2. Пробой тела от 0.8% до 4.0%
+    # 3. Закрытие полнотелое красное (Close < Open)
+    # 4. Нижняя тень маленькая (<= 25% свечи) — покупатели не откупают
+    # 5. Объем в 2x выше среднего
+    # 6. CVD CONFIRMATION: Кумулятивная дельта пробила минимум базы
+    if trigger["close"] < range_low:
+        break_pct = ((range_low - trigger["close"]) / range_low) * 100
+        lower_wick = min(trigger["open"], trigger["close"]) - trigger["low"]
+        wick_ratio = lower_wick / c_range
 
-        # УСЛОВИЕ 1: Пробой ценового High диапазона
-        price_breakout = trigger["close"] > range_high
-        
-        # УСЛОВИЕ 2: Медвежья дивергенция по CVD (цена на пике, а CVD ниже пика диапазона)
-        cvd_divergence = trigger["cvd"] < max_history_cvd
+        if (MIN_BREAK_PCT <= break_pct <= MAX_BREAK_PCT and
+            trigger["close"] < trigger["open"] and
+            wick_ratio <= 0.25 and
+            trigger["volume"] >= avg_vol * VOLUME_MULTIPLIER and
+            trigger["cvd"] < min_history_cvd):
 
-        if price_breakout and cvd_divergence:
-            break_pct = ((trigger["close"] - range_high) / range_high) * 100
+            event_key = (symbol, trigger["time"], "REAL_BREAK_BEAR")
+            if event_key not in notified_events:
+                notified_events.add(event_key)
+                send_tg(
+                    f"💥 <b>ИСТИННЫЙ ПРОБОЙ ЛОЯ (SHORT): {symbol}</b>\n\n"
+                    f"• Пробитый уровень Low: <code>{range_low}</code>\n"
+                    f"• Закрытие свечи: <code>{trigger['close']}</code> (Закрепление: <code>-{break_pct:.2f}%</code>)\n"
+                    f"• Нижняя тень: всего <code>{wick_ratio*100:.0f}%</code> (нет откупа покупателя)\n"
+                    f"• Всплеск объёма: <code>{trigger['volume']/avg_vol:.1f}x</code> от среднего\n"
+                    f"• <b>CVD рекорд:</b> шквал маркет-продаж пробил поддержки\n\n"
+                    f"💡 <i>Вход: на ретесте пробитого уровня {range_low} на M5 или по рынку. Стоп над {range_low}.</i>\n"
+                    f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
+                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
+                )
 
-            if (MIN_BREAK_PCT_M15 <= break_pct <= MAX_BREAK_PCT_M15 and
-                trigger["volume"] >= avg_vol * VOL_MULT_M15):
-
-                event_key = (symbol, trigger["time"], "CVD_DIV")
-                if event_key not in notified_events:
-                    notified_events.add(event_key)
-                    
-                    stop_loss = trigger["high"]
-                    curr_price = trigger["close"]
-                    risk_pct = ((stop_loss - curr_price) / curr_price) * 100
-
-                    send_tg(
-                        f"⚠️ <b>ПРОБОЙ С МЕДВЕЖЬЕЙ ДИВЕРГЕНЦИЕЙ CVD: {symbol}</b>\n\n"
-                        f"• Уровень пробоя: <code>{range_high}</code>\n"
-                        f"• Цена закрытия: <code>{curr_price}</code> (+{break_pct:.2f}%)\n"
-                        f"• Объем: <code>{trigger['volume'] / avg_vol:.1f}x</code> от среднего\n"
-                        f"• Текущий CVD: <code>{trigger['cvd']:,.0f}</code>\n"
-                        f"• Макс. CVD базы: <code>{max_history_cvd:,.0f}</code>\n"
-                        f"• Стоп-лосс (High): <code>{stop_loss}</code> (риск: <code>{risk_pct:.2f}%</code>)\n\n"
-                        f"📉 <i>Цена показала пробой максимума, но аккумуляция дельты (CVD) падает. Маркет-покупатель отсутствует, рост происходит на пассивном лимитном исполнении.</i>\n"
-                        f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
-                        f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
-                    )
-                    print(f"🎯 Найдена дивергенция на {symbol}")
-        time.sleep(0.04)
+def wait_for_m15_close():
+    now = time.time()
+    interval = 15 * 60
+    sleep_time = interval - (now % interval) + 3
+    time.sleep(sleep_time)
 
 def main():
-    print("✓ Запуск скринера дивергенций CVD на M15...")
+    print("✓ Запуск шорт-скринера истинных пробоев (Real Breakout Low + CVD)...")
     symbols = get_active_symbols()
     print(f"Отслеживается {len(symbols)} инструментов.")
 
-    last_m15_checked = 0
-
     while True:
         try:
-            now = time.time()
-            # Проверка каждые 15 минут в момент закрытия свечи
-            if now - last_m15_checked >= 900 or (int(now) % 900 < 5 and now - last_m15_checked > 60):
-                symbols = get_active_symbols()
-                scan_cvd_divergence(symbols)
-                last_m15_checked = now
+            wait_for_m15_close()
+            print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Проверка импульсов в шорт...")
 
-            if len(notified_events) > 200:
+            for s in symbols:
+                scan_real_breakout(s)
+                time.sleep(0.05)
+
+            if len(notified_events) > 300:
                 notified_events.clear()
 
-            time.sleep(10)
-
         except Exception as e:
-            print(f"Ошибка главного цикла: {e}")
+            print(f"Ошибка цикла: {e}")
             time.sleep(5)
 
 if __name__ == "__main__":
