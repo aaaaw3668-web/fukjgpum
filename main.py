@@ -1,18 +1,21 @@
 import os
 import time
+import statistics
 import requests
 
-# Настройки Telegram
+# --- Настройки Telegram ---
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-# Параметры стратегии Истинного Пробоя (Long Only + Volume)
-TIMEFRAME = "15"               # Таймфрейм M15
-LOOKBACK_CANDLES = 48          # База консолидации: 48 свечей (12 часов)
-MIN_BREAK_PCT = 0.8            # Тело должно закрепиться минимум на 0.8% выше уровня
-MAX_BREAK_PCT = 4.0            # Если свеча улетела на 7-10%, заходить уже поздно (FOMO)
-VOLUME_MULTIPLIER = 2.0        # Объем на свече пробоя должен быть минимум в 2 раза выше среднего
-MIN_TURNOVER_24H = 15_000  # Фильтр ликвидности
+# --- Параметры стратегии пробоя (Long Only) ---
+TIMEFRAME = "15"               # Рабочий таймфрейм M15
+LOOKBACK_CANDLES = 48          # Консолидация: 48 свечей (12 часов)
+MIN_BREAK_PCT = 0.8            # Закрепление выше уровня минимум на +0.8%
+MAX_BREAK_PCT = 4.0            # Защита от FOMO (если свеча улетела > 4%, вход пропускается)
+VOLUME_MULTIPLIER = 2.5        # Текущий оборот в USDT >= 2.5x от медианы консолидации
+MIN_Z_SCORE = 2.0              # Статистический выброс объема (Z >= 2.0)
+BUY_RATIO_MIN = 0.60           # Доля маркет-покупок на свече пробоя >= 60%
+MIN_TURNOVER_24H = 15_000  # Ликвидность: от $15 млн за 24 часа
 
 session = requests.Session()
 notified_events = set()
@@ -47,7 +50,7 @@ def get_active_symbols():
     return []
 
 def get_candles_data(symbol: str):
-    """Сбор свечей с расчетом дельты и накопительного CVD"""
+    """Сбор свечей с оборотом в USDT."""
     url = "https://api.bybit.com/v5/market/kline"
     params = {
         "category": "linear",
@@ -58,36 +61,61 @@ def get_candles_data(symbol: str):
     try:
         res = session.get(url, params=params, timeout=5).json()
         if res.get("retCode") == 0 and res["result"]["list"]:
+            # Отсекаем нулевую незакрытую свечу и берем закрытую базу
             raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_CANDLES + 1]))
             
             candles = []
-            cum_delta = 0.0
-
             for k in raw_candles:
-                c_open = float(k[1])
-                c_high = float(k[2])
-                c_low = float(k[3])
-                c_close = float(k[4])
-                c_vol = float(k[5])
-
-                c_range = c_high - c_low
-                delta = (c_vol * ((c_close - c_open) / c_range)) if c_range > 0 else 0.0
-                cum_delta += delta
-
                 candles.append({
                     "time": int(k[0]),
-                    "open": c_open,
-                    "high": c_high,
-                    "low": c_low,
-                    "close": c_close,
-                    "volume": c_vol,
-                    "delta": delta,
-                    "cvd": cum_delta
+                    "open": float(k[1]),
+                    "high": float(k[2]),
+                    "low": float(k[3]),
+                    "close": float(k[4]),
+                    "turnover": float(k[6])  # Реальный объем свечи в USDT
                 })
             return candles
     except Exception:
         pass
     return []
+
+def get_exact_trigger_delta(symbol: str, candle_start_time: int):
+    """
+    Расчет реальной дельты через публичную ленту сделок Bybit.
+    Суммирует агрессивные рыночные покупки (Buy) и продажи (Sell).
+    """
+    url = "https://api.bybit.com/v5/market/recent-trade"
+    params = {
+        "category": "linear",
+        "symbol": symbol,
+        "limit": 1000
+    }
+    try:
+        res = session.get(url, params=params, timeout=5).json()
+        if res.get("retCode") == 0:
+            trades = res["result"]["list"]
+            buy_vol_usdt = 0.0
+            sell_vol_usdt = 0.0
+
+            for t in trades:
+                trade_time = int(t["time"])
+                # Учитываем только сделки внутри временного окна пробойной свечи
+                if trade_time >= candle_start_time:
+                    size_usdt = float(t["size"]) * float(t["price"])
+                    if t["side"] == "Buy":
+                        buy_vol_usdt += size_usdt
+                    else:
+                        sell_vol_usdt += size_usdt
+
+            total_trades_vol = buy_vol_usdt + sell_vol_usdt
+            if total_trades_vol > 0:
+                buy_ratio = buy_vol_usdt / total_trades_vol
+                net_delta_usdt = buy_vol_usdt - sell_vol_usdt
+                return net_delta_usdt, buy_ratio
+
+    except Exception:
+        pass
+    return 0.0, 0.5
 
 def scan_real_breakout(symbol: str):
     candles = get_candles_data(symbol)
@@ -97,47 +125,65 @@ def scan_real_breakout(symbol: str):
     trigger = candles[-1]
     history = candles[:-1]
 
-    range_high = max(c["high"] for c in history)
-    max_history_cvd = max(c["cvd"] for c in history)
-    avg_vol = sum(c["volume"] for c in history) / len(history)
-
     c_range = trigger["high"] - trigger["low"]
     if c_range == 0:
         return
 
-    # --- ИСТИННЫЙ ПРОБОЙ ВВЕРХ (LONG MOMENTUM) ---
-    # Условия:
-    # 1. Свеча закрылась СТРОГО выше уровня High базы
-    # 2. Пробой тела от 0.8% до 4.0%
-    # 3. Закрытие полнотелое зеленое (Close > Open)
-    # 4. Верхняя тень маленькая (<= 25% свечи) — продавцы не сопротивляются
-    # 5. Объем в 2x выше среднего
-    # 6. CVD CONFIRMATION: Кумулятивная дельта пробила свой максимум
-    if trigger["close"] > range_high:
-        break_pct = ((trigger["close"] - range_high) / range_high) * 100
-        upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
-        wick_ratio = upper_wick / c_range
+    range_high = max(c["high"] for c in history)
 
-        if (MIN_BREAK_PCT <= break_pct <= MAX_BREAK_PCT and
-            trigger["close"] > trigger["open"] and
-            wick_ratio <= 0.25 and
-            trigger["volume"] >= avg_vol * VOLUME_MULTIPLIER and
-            trigger["cvd"] > max_history_cvd):
+    # 1. Первичный фильтр по ценовому закреплению
+    if trigger["close"] <= range_high:
+        return
 
-            event_key = (symbol, trigger["time"], "REAL_BREAK_BULL")
-            if event_key not in notified_events:
-                notified_events.add(event_key)
-                send_tg(
-                    f"🚀 <b>ИСТИННЫЙ ПРОБОЙ ХАЯ (LONG): {symbol}</b>\n\n"
-                    f"• Пробитый уровень High: <code>{range_high}</code>\n"
-                    f"• Закрытие свечи: <code>{trigger['close']}</code> (Закрепление: <code>+{break_pct:.2f}%</code>)\n"
-                    f"• Верхняя тень: всего <code>{wick_ratio*100:.0f}%</code> (нет сопротивления продавца)\n"
-                    f"• Всплеск объёма: <code>{trigger['volume']/avg_vol:.1f}x</code> от среднего\n"
-                    f"• <b>CVD рекорд:</b> агрессивные маркет-покупки вынесли стакан\n\n"
-                    f"💡 <i>Вход: на ретесте пробитого уровня {range_high} на M5 или по рынку. Стоп под {range_high}.</i>\n"
-                    f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
-                    f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
-                )
+    break_pct = ((trigger["close"] - range_high) / range_high) * 100
+    if not (MIN_BREAK_PCT <= break_pct <= MAX_BREAK_PCT):
+        return
+
+    if trigger["close"] <= trigger["open"]:
+        return
+
+    upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
+    wick_ratio = upper_wick / c_range
+    if wick_ratio > 0.25:
+        return
+
+    # 2. Фильтр объема по USDT (Медиана + Z-Score)
+    history_turnovers = [c["turnover"] for c in history]
+    median_vol = statistics.median(history_turnovers)
+    mean_vol = statistics.mean(history_turnovers)
+    stdev_vol = statistics.stdev(history_turnovers) if len(history_turnovers) > 1 else 1.0
+
+    if median_vol <= 0:
+        return
+
+    vol_surge_ratio = trigger["turnover"] / median_vol
+    z_score = (trigger["turnover"] - mean_vol) / stdev_vol if stdev_vol > 0 else 0.0
+
+    if vol_surge_ratio < VOLUME_MULTIPLIER or z_score < MIN_Z_SCORE:
+        return
+
+    # 3. Фильтр реальной дельты (Time & Sales)
+    net_delta_usdt, buy_ratio = get_exact_trigger_delta(symbol, trigger["time"])
+    if buy_ratio < BUY_RATIO_MIN or net_delta_usdt <= 0:
+        return
+
+    # Отправка уведомления
+    event_key = (symbol, trigger["time"], "REAL_BREAK_LONG")
+    if event_key not in notified_events:
+        notified_events.add(event_key)
+        send_tg(
+            f"🚀 <b>ИСТИННЫЙ ПРОБОЙ ХАЯ (LONG): {symbol}</b>\n\n"
+            f"• Пробитый High: <code>{range_high}</code>\n"
+            f"• Закрытие: <code>{trigger['close']}</code> (Закрепление: <code>+{break_pct:.2f}%</code>)\n"
+            f"• Верхняя тень: <code>{wick_ratio * 100:.0f}%</code> (нет лимитного продавца)\n"
+            f"• Оборот в USDT: <code>${trigger['turnover']:,.0f}</code>\n"
+            f"• Всплеск объема: <code>{vol_surge_ratio:.1f}x</code> к медиане (Z: <code>{z_score:.2f}σ</code>)\n"
+            f"• <b>Реальная лента сделок:</b> маркет-покупки <code>{buy_ratio * 100:.1f}%</code>\n"
+            f"• Чистая дельта: <code>+${net_delta_usdt:,.0f}</code> агрессивных покупок\n\n"
+            f"💡 <i>Вход: на ретесте уровня {range_high} или по рынку со стопом под {range_high}.</i>\n"
+            f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
+            f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
+        )
 
 def wait_for_m15_close():
     now = time.time()
@@ -146,18 +192,18 @@ def wait_for_m15_close():
     time.sleep(sleep_time)
 
 def main():
-    print("✓ Запуск лонг-скринера истинных пробоев (Real Breakout High + Volume)...")
+    print("✓ Запуск лонг-скринера (Медианный USDT-объем + лента сделок Bybit T&S)...")
     symbols = get_active_symbols()
-    print(f"Отслеживается {len(symbols)} инструментов.")
+    print(f"Отслеживается {len(symbols)} инструментов с оборотом > $15M.")
 
     while True:
         try:
             wait_for_m15_close()
-            print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Проверка импульсов в лонг...")
+            print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Проверка сигналов...")
 
             for s in symbols:
                 scan_real_breakout(s)
-                time.sleep(0.05)
+                time.sleep(0.04)
 
             if len(notified_events) > 300:
                 notified_events.clear()
