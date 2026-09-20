@@ -15,7 +15,7 @@ MAX_BREAK_PCT = 4.0            # Защита от FOMO (если свеча у�
 VOLUME_MULTIPLIER = 2.5        # Текущий оборот в USDT >= 2.5x от медианы консолидации
 MIN_Z_SCORE = 2.0              # Статистический выброс объема (Z >= 2.0)
 BUY_RATIO_MIN = 0.60           # Доля маркет-покупок на свече пробоя >= 60%
-MIN_TURNOVER_24H = 15_000  # Ликвидность: от $15 млн за 24 часа
+MIN_TURNOVER_24H = 100_000  # Ликвидность: от $15 млн за 24 часа
 
 session = requests.Session()
 notified_events = set()
