@@ -7,15 +7,14 @@ import requests
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 
-# --- Параметры стратегии пробоя (Long Only) ---
-TIMEFRAME = "15"               # Рабочий таймфрейм M15
+# --- Параметры стратегии: Ложный пробой на сбросе OI ---
+TIMEFRAME = "15"               # Таймфрейм свечей и OI (15m)
 LOOKBACK_CANDLES = 48          # Консолидация: 48 свечей (12 часов)
-MIN_BREAK_PCT = 0.8            # Закрепление выше уровня минимум на +0.8%
-MAX_BREAK_PCT = 4.0            # Защита от FOMO (если свеча улетела > 4%, вход пропускается)
-VOLUME_MULTIPLIER = 2.5        # Текущий оборот в USDT >= 2.5x от медианы консолидации
-MIN_Z_SCORE = 2.0              # Статистический выброс объема (Z >= 2.0)
-BUY_RATIO_MIN = 0.60           # Доля маркет-покупок на свече пробоя >= 60%
-MIN_TURNOVER_24H = 100_000  # Ликвидность: от $15 млн за 24 часа
+MIN_BREAK_PCT = 0.3            # Минимальный вынос за хай: +0.3%
+VOLUME_MULTIPLIER = 2.0        # Объем свечи в USDT >= 2.0x от медианы консолидации
+MIN_Z_SCORE = 1.8              # Статистический выброс объема (Z >= 1.8)
+MIN_OI_DROP_PCT = 1.0          # Минимальное падение открытого интереса: -1.0% за свечу
+MIN_TURNOVER_24H = 100_000  # Фильтр ликвидности: от $100 тыс за 24 часа
 
 session = requests.Session()
 notified_events = set()
@@ -50,7 +49,7 @@ def get_active_symbols():
     return []
 
 def get_candles_data(symbol: str):
-    """Сбор свечей с оборотом в USDT."""
+    """Сбор закрытых свечей с ценами и оборотом в USDT."""
     url = "https://api.bybit.com/v5/market/kline"
     params = {
         "category": "linear",
@@ -61,9 +60,8 @@ def get_candles_data(symbol: str):
     try:
         res = session.get(url, params=params, timeout=5).json()
         if res.get("retCode") == 0 and res["result"]["list"]:
-            # Отсекаем нулевую незакрытую свечу и берем закрытую базу
+            # Пропускаем текущую незакрытую свечу (индекс 0)
             raw_candles = list(reversed(res["result"]["list"][1:LOOKBACK_CANDLES + 1]))
-            
             candles = []
             for k in raw_candles:
                 candles.append({
@@ -72,52 +70,46 @@ def get_candles_data(symbol: str):
                     "high": float(k[2]),
                     "low": float(k[3]),
                     "close": float(k[4]),
-                    "turnover": float(k[6])  # Реальный объем свечи в USDT
+                    "turnover": float(k[6])
                 })
             return candles
     except Exception:
         pass
     return []
 
-def get_exact_trigger_delta(symbol: str, candle_start_time: int):
+def get_oi_change(symbol: str, candle_start_time: int):
     """
-    Расчет реальной дельты через публичную ленту сделок Bybit.
-    Суммирует агрессивные рыночные покупки (Buy) и продажи (Sell).
+    Запрашивает историю Open Interest с Bybit API
+    и вычисляет процентное изменение за интервал сигнальной свечи.
     """
-    url = "https://api.bybit.com/v5/market/recent-trade"
+    url = "https://api.bybit.com/v5/market/open-interest"
+    # Интервал 15m для Open Interest в API Bybit передается как '15min'
+    interval_str = "15min" if TIMEFRAME == "15" else f"{TIMEFRAME}min"
+    
+    # Запрашиваем 3 последние точки OI
     params = {
         "category": "linear",
         "symbol": symbol,
-        "limit": 1000
+        "intervalTime": interval_str,
+        "limit": 3
     }
     try:
         res = session.get(url, params=params, timeout=5).json()
-        if res.get("retCode") == 0:
-            trades = res["result"]["list"]
-            buy_vol_usdt = 0.0
-            sell_vol_usdt = 0.0
-
-            for t in trades:
-                trade_time = int(t["time"])
-                # Учитываем только сделки внутри временного окна пробойной свечи
-                if trade_time >= candle_start_time:
-                    size_usdt = float(t["size"]) * float(t["price"])
-                    if t["side"] == "Buy":
-                        buy_vol_usdt += size_usdt
-                    else:
-                        sell_vol_usdt += size_usdt
-
-            total_trades_vol = buy_vol_usdt + sell_vol_usdt
-            if total_trades_vol > 0:
-                buy_ratio = buy_vol_usdt / total_trades_vol
-                net_delta_usdt = buy_vol_usdt - sell_vol_usdt
-                return net_delta_usdt, buy_ratio
-
+        if res.get("retCode") == 0 and res["result"]["list"]:
+            records = res["result"]["list"]
+            if len(records) >= 2:
+                # records[0] — текущее значение, records[1] — предыдущее
+                curr_oi = float(records[0]["openInterest"])
+                prev_oi = float(records[1]["openInterest"])
+                
+                if prev_oi > 0:
+                    oi_change_pct = ((curr_oi - prev_oi) / prev_oi) * 100
+                    return oi_change_pct, curr_oi, prev_oi
     except Exception:
         pass
-    return 0.0, 0.5
+    return 0.0, 0.0, 0.0
 
-def scan_real_breakout(symbol: str):
+def scan_fakeout_oi(symbol: str):
     candles = get_candles_data(symbol)
     if not candles or len(candles) < LOOKBACK_CANDLES:
         return
@@ -125,29 +117,17 @@ def scan_real_breakout(symbol: str):
     trigger = candles[-1]
     history = candles[:-1]
 
-    c_range = trigger["high"] - trigger["low"]
-    if c_range == 0:
-        return
-
     range_high = max(c["high"] for c in history)
 
-    # 1. Первичный фильтр по ценовому закреплению
-    if trigger["close"] <= range_high:
+    # 1. Проверка обновления максимума
+    if trigger["high"] <= range_high:
         return
 
-    break_pct = ((trigger["close"] - range_high) / range_high) * 100
-    if not (MIN_BREAK_PCT <= break_pct <= MAX_BREAK_PCT):
+    break_pct = ((trigger["high"] - range_high) / range_high) * 100
+    if break_pct < MIN_BREAK_PCT:
         return
 
-    if trigger["close"] <= trigger["open"]:
-        return
-
-    upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
-    wick_ratio = upper_wick / c_range
-    if wick_ratio > 0.25:
-        return
-
-    # 2. Фильтр объема по USDT (Медиана + Z-Score)
+    # 2. Фильтр объема (аномальный всплеск)
     history_turnovers = [c["turnover"] for c in history]
     median_vol = statistics.median(history_turnovers)
     mean_vol = statistics.mean(history_turnovers)
@@ -162,25 +142,32 @@ def scan_real_breakout(symbol: str):
     if vol_surge_ratio < VOLUME_MULTIPLIER or z_score < MIN_Z_SCORE:
         return
 
-    # 3. Фильтр реальной дельты (Time & Sales)
-    net_delta_usdt, buy_ratio = get_exact_trigger_delta(symbol, trigger["time"])
-    if buy_ratio < BUY_RATIO_MIN or net_delta_usdt <= 0:
+    # 3. Фильтр Открытого Интереса: падение OI на пробое
+    oi_change_pct, curr_oi, prev_oi = get_oi_change(symbol, trigger["time"])
+    
+    # Падение OI должно превышать заданный порог (например, <= -1.0%)
+    if oi_change_pct > -MIN_OI_DROP_PCT:
         return
 
-    # Отправка уведомления
-    event_key = (symbol, trigger["time"], "REAL_BREAK_LONG")
+    # Расчет верхней тени (признак отторжения цены)
+    c_range = trigger["high"] - trigger["low"]
+    upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
+    wick_ratio = upper_wick / c_range if c_range > 0 else 0.0
+
+    event_key = (symbol, trigger["time"], "OI_DROP_FAKEOUT")
     if event_key not in notified_events:
         notified_events.add(event_key)
         send_tg(
-            f"🚀 <b>ИСТИННЫЙ ПРОБОЙ ХАЯ (LONG): {symbol}</b>\n\n"
-            f"• Пробитый High: <code>{range_high}</code>\n"
-            f"• Закрытие: <code>{trigger['close']}</code> (Закрепление: <code>+{break_pct:.2f}%</code>)\n"
-            f"• Верхняя тень: <code>{wick_ratio * 100:.0f}%</code> (нет лимитного продавца)\n"
-            f"• Оборот в USDT: <code>${trigger['turnover']:,.0f}</code>\n"
-            f"• Всплеск объема: <code>{vol_surge_ratio:.1f}x</code> к медиане (Z: <code>{z_score:.2f}σ</code>)\n"
-            f"• <b>Реальная лента сделок:</b> маркет-покупки <code>{buy_ratio * 100:.1f}%</code>\n"
-            f"• Чистая дельта: <code>+${net_delta_usdt:,.0f}</code> агрессивных покупок\n\n"
-            f"💡 <i>Вход: на ретесте уровня {range_high} или по рынку со стопом под {range_high}.</i>\n"
+            f"⚡ <b>ВЫНОС СТОПОВ / ЛОЖНЫЙ ПРОБОЙ (SHORT): {symbol}</b>\n\n"
+            f"• Пробиваемый High: <code>{range_high}</code>\n"
+            f"• Максимум свечи: <code>{trigger['high']}</code> (Вынос: <code>+{break_pct:.2f}%</code>)\n"
+            f"• Закрытие свечи: <code>{trigger['close']}</code>\n"
+            f"• Верхняя тень: <code>{wick_ratio * 100:.0f}%</code>\n"
+            f"• Объем в USDT: <code>${trigger['turnover']:,.0f}</code>\n"
+            f"• Всплеск объема: <code>{vol_surge_ratio:.1f}x</code> (Z: <code>{z_score:.2f}σ</code>)\n"
+            f"• <b>Динамика OI:</b> <code>{oi_change_pct:.2f}%</code> (сброс позиций)\n"
+            f"• OI: <code>{prev_oi:,.0f}</code> ➔ <code>{curr_oi:,.0f}</code>\n\n"
+            f"💡 <i>Механика: Всплеск объема сопровождался ликвидацией/закрытием шортов (падение OI). Новых покупок нет. Возможен Short со стопом за {trigger['high']}.</i>\n"
             f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
             f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
         )
@@ -192,7 +179,7 @@ def wait_for_m15_close():
     time.sleep(sleep_time)
 
 def main():
-    print("✓ Запуск лонг-скринера (Медианный USDT-объем + лента сделок Bybit T&S)...")
+    print("✓ Запуск скринера: Пробой High + Всплеск объема + Падение OI...")
     symbols = get_active_symbols()
     print(f"Отслеживается {len(symbols)} инструментов с оборотом > $15M.")
 
@@ -202,7 +189,7 @@ def main():
             print(f"[{time.strftime('%H:%M:%S')}] Свеча M15 закрылась. Проверка сигналов...")
 
             for s in symbols:
-                scan_real_breakout(s)
+                scan_fakeout_oi(s)
                 time.sleep(0.04)
 
             if len(notified_events) > 300:
