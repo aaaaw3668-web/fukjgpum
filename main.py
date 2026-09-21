@@ -11,10 +11,10 @@ CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "5296533274")
 TIMEFRAME = "15"               # Таймфрейм свечей и OI (15m)
 LOOKBACK_CANDLES = 48          # Консолидация: 48 свечей (12 часов)
 MIN_BREAK_PCT = 2            # Минимальный вынос за хай: +0.3%
-VOLUME_MULTIPLIER = 2.0        # Объем свечи в USDT >= 2.0x от медианы консолидации
+VOLUME_MULTIPLIER = 3        # Объем свечи в USDT >= 2.0x от медианы консолидации
 MIN_Z_SCORE = 1.8              # Статистический выброс объема (Z >= 1.8)
-MIN_OI_DROP_PCT = 1.0          # Минимальное падение открытого интереса: -1.0% за свечу
-MIN_TURNOVER_24H = 1_000_000  # Фильтр ликвидности: от $15 млн за 24 часа
+MIN_OI_DROP_PCT = 4.0          # Минимальное падение открытого интереса: -1.0% за свечу
+MIN_TURNOVER_24H = 100_000  # Фильтр ликвидности: от $15 млн за 24 часа
 
 session = requests.Session()
 notified_events = set()
