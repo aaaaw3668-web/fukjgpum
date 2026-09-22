@@ -16,6 +16,21 @@ MIN_Z_SCORE = 1.8              # Статистический выброс об�
 MIN_OI_DROP_PCT = 4.0          # Минимальное падение открытого интереса: -4.0% за свечу
 MIN_TURNOVER_24H = 10_000  # Фильтр ликвидности: от 100 тыс за 24 часа
 
+# --- Бан-лист традиционных активов (акции, сырье, форекс, индексы) ---
+BLACKLIST_SYMBOLS = {
+    # Акции (US Stocks)
+    "AAPLUSDT", "TSLAUSDT", "NVDAUSDT", "MSFTUSDT", "AMZNUSDT", "GOOGLUSDT",
+    "METAUSDT", "COINUSDT", "MSTRUSDT", "AMDUSDT", "PLTRUSDT", "BABAUSDT",
+    "NFLXUSDT", "INTCUSDT", "DISUSDT", "NIOUSDT", "PYPLUSDT", "HOODUSDT",
+    "MARAUSDT", "RIOTUSDT", "CLSKUSDT", "AVGOUSDT", "SMCIUSDT", "ARMUSDT",
+    # Сырье и металлы (Commodities)
+    "PAXGUSDT", "XAUUSDT", "XAGUSDT", "WTIUSDT", "BRENTUSDT", "NATGASUSDT",
+    # Индексы (Indices)
+    "SP500USDT", "DJIAUSDT", "NDXUSDT", "US500USDT", "US30USDT", "US100USDT",
+    # Форекс (Forex)
+    "EURUSDT", "GBPUSDT", "AUDUSDT", "JPYUSDT", "CADUSDT", "CHFUSDT"
+}
+
 session = requests.Session()
 notified_events = set()
 
@@ -42,11 +57,30 @@ def get_active_symbols():
         if res.get("retCode") == 0:
             return [
                 item["symbol"] for item in res["result"]["list"]
-                if item["symbol"].endswith("USDT") and float(item.get("turnover24h", 0)) >= MIN_TURNOVER_24H
+                if item["symbol"].endswith("USDT") 
+                and item["symbol"] not in BLACKLIST_SYMBOLS
+                and float(item.get("turnover24h", 0)) >= MIN_TURNOVER_24H
             ]
     except Exception as e:
         print(f"Ошибка загрузки тикеров: {e}")
     return []
+
+def get_funding_rate(symbol: str):
+    """Возвращает текущую ставку финансирования (funding rate)."""
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {
+        "category": "linear",
+        "symbol": symbol
+    }
+    try:
+        res = session.get(url, params=params, timeout=5).json()
+        if res.get("retCode") == 0 and res["result"]["list"]:
+            rate_raw = res["result"]["list"][0].get("fundingRate")
+            if rate_raw is not None and rate_raw != "":
+                return float(rate_raw)
+    except Exception:
+        pass
+    return None
 
 def get_candles_data(symbol: str):
     """Сбор закрытых свечей с ценами и оборотом в USDT."""
@@ -110,6 +144,10 @@ def get_oi_change(symbol: str, candle_start_time: int):
     return 0.0, 0.0, 0.0
 
 def scan_fakeout_oi(symbol: str):
+    # Дополнительная проверка на случай динамических изменений списка
+    if symbol in BLACKLIST_SYMBOLS:
+        return
+
     candles = get_candles_data(symbol)
     if not candles or len(candles) < LOOKBACK_CANDLES:
         return
@@ -149,6 +187,11 @@ def scan_fakeout_oi(symbol: str):
     if oi_change_pct > -MIN_OI_DROP_PCT:
         return
 
+    # 4. Фильтр фандинга: пропускаем только строго положительный фандинг
+    funding_rate = get_funding_rate(symbol)
+    if funding_rate is None or funding_rate <= 0:
+        return
+
     # Расчет верхней тени (признак отторжения цены)
     c_range = trigger["high"] - trigger["low"]
     upper_wick = trigger["high"] - max(trigger["open"], trigger["close"])
@@ -166,7 +209,8 @@ def scan_fakeout_oi(symbol: str):
             f"• Объем в USDT: <code>${trigger['turnover']:,.0f}</code>\n"
             f"• Всплеск объема: <code>{vol_surge_ratio:.1f}x</code> (Z: <code>{z_score:.2f}σ</code>)\n"
             f"• <b>Динамика OI:</b> <code>{oi_change_pct:.2f}%</code> (сброс позиций)\n"
-            f"• OI: <code>{prev_oi:,.0f}</code> ➔ <code>{curr_oi:,.0f}</code>\n\n"
+            f"• OI: <code>{prev_oi:,.0f}</code> ➔ <code>{curr_oi:,.0f}</code>\n"
+            f"• <b>Фандинг:</b> <code>+{funding_rate * 100:.4f}%</code>\n\n"
             f"💡 <i>Механика: Всплеск объема сопровождался ликвидацией/закрытием шортов (падение OI). Новых покупок нет. Возможен Short со стопом за {trigger['high']}.</i>\n"
             f"🔗 <a href='https://www.bybit.com/trade/usdt/{symbol}'>Bybit</a> | "
             f"<a href='https://www.coinglass.com/tv/Bybit_{symbol}'>CoinGlass</a>"
