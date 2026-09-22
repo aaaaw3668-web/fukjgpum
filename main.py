@@ -13,7 +13,7 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # Пороги срабатывания (синхронный лонговый импульс)
-PRICE_INCREASE_THRESHOLD = 2.5   # Рост цены от +2.5%
+PRICE_INCREASE_THRESHOLD = 1.5   # Рост цены от +1.5%
 OI_INCREASE_THRESHOLD = 3.0      # Рост OI от +3.0%
 
 TIME_WINDOW = 60 * 15              # Окно анализа: 5 минут (300 сек)
