@@ -12,11 +12,11 @@ if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
-# Пороги срабатывания (синхронный шортовый импульс: падение цены + рост OI)
-PRICE_DROP_THRESHOLD = -2.5      # Падение цены от -2.5% и ниже
+# Пороги срабатывания (синхронный лонговый импульс)
+PRICE_INCREASE_THRESHOLD = 2.5   # Рост цены от +2.5%
 OI_INCREASE_THRESHOLD = 3.0      # Рост OI от +3.0%
 
-TIME_WINDOW = 60 * 15              # Окно анализа: 15 минут (900 сек)
+TIME_WINDOW = 60 * 15              # Окно анализа: 5 минут (300 сек)
 COOLDOWN_MINUTES = 10             # Пауза между алертами по одной монете
 DAILY_ALERT_LIMIT = 100           # Суточный лимит уведомлений на одну монету
 
@@ -250,7 +250,7 @@ def fetch_all_bybit_tickers():
 
 # ==================== ОСНОВНОЙ ЦИКЛ ====================
 def main():
-    print("=== Запуск мониторинга (Падение цены от -2.5% И Рост OI от +3.0%) ===")
+    print("=== Запуск мониторинга (Рост цены от +2.5% И Рост OI от +3.0%) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -310,17 +310,17 @@ def main():
                     oi_change = calculate_change(old_oi, current_oi)
                     price_change = calculate_change(old_price, current_price)
 
-                    # Условие: Одновременное падение цены <= -2.5% И рост открытого интереса >= +3.0%
-                    if price_change <= PRICE_DROP_THRESHOLD and oi_change >= OI_INCREASE_THRESHOLD:
+                    # Условие: Одновременный рост цены >= +2.5% И открытого интереса >= +3.0%
+                    if price_change >= PRICE_INCREASE_THRESHOLD and oi_change >= OI_INCREASE_THRESHOLD:
                         last_time = last_alert_time.get(symbol, 0)
                         
                         # Проверяем, прошел ли кулдаун (10 минут)
                         if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
                             msg = (
-                                f"🔻 <b>{symbol}</b>: Набор позиций / Вливание в шорт\n\n"
-                                f"📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>\n"
+                                f"🚀 <b>{symbol}</b>: Набор позиций / Вливание в лонг\n\n"
+                                f"📈 <b>Рост цены:</b> <code>+{price_change:.2f}%</code>\n"
                                 f"📊 <b>Приток OI:</b> <code>+{oi_change:.2f}%</code>\n"
-                                f"⏱ <b>Интервал:</b> последние 15 мин."
+                                f"⏱ <b>Интервал:</b> последние 5 мин."
                             )
                             for chat_id in list(users.keys()):
                                 send_telegram_notification(chat_id, msg, symbol)
