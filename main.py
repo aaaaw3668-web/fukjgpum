@@ -16,7 +16,7 @@ if not TELEGRAM_BOT_TOKEN:
 PRICE_INCREASE_THRESHOLD = 2.5   # Рост цены от +2.5%
 OI_INCREASE_THRESHOLD = 3.0      # Рост OI от +3.0%
 
-TIME_WINDOW = 60 * 5              # Окно анализа: 5 минут (300 сек)
+TIME_WINDOW = 60 * 15              # Окно анализа: 5 минут (300 сек)
 COOLDOWN_MINUTES = 10             # Пауза между алертами по одной монете
 DAILY_ALERT_LIMIT = 100           # Суточный лимит уведомлений на одну монету
 
