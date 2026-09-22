@@ -13,7 +13,8 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # Пороги срабатывания (синхронный лонговый импульс)
-PRICE_INCREASE_THRESHOLD = 1.5   # Рост цены от +1.5%
+PRICE_INCREASE_MIN = 1.0         # Минимальный рост цены: от +1.0%
+PRICE_INCREASE_MAX = 2.5         # Максимальный рост цены: до +2.5%
 OI_INCREASE_THRESHOLD = 3.0      # Рост OI от +3.0%
 
 TIME_WINDOW = 60 * 15              # Окно анализа: 5 минут (300 сек)
@@ -250,7 +251,7 @@ def fetch_all_bybit_tickers():
 
 # ==================== ОСНОВНОЙ ЦИКЛ ====================
 def main():
-    print("=== Запуск мониторинга (Рост цены от +2.5% И Рост OI от +3.0%) ===")
+    print(f"=== Запуск мониторинга (Рост цены от +{PRICE_INCREASE_MIN}% до +{PRICE_INCREASE_MAX}% И Рост OI от +{OI_INCREASE_THRESHOLD}%) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -310,8 +311,8 @@ def main():
                     oi_change = calculate_change(old_oi, current_oi)
                     price_change = calculate_change(old_price, current_price)
 
-                    # Условие: Одновременный рост цены >= +2.5% И открытого интереса >= +3.0%
-                    if price_change >= PRICE_INCREASE_THRESHOLD and oi_change >= OI_INCREASE_THRESHOLD:
+                    # Условие: Рост цены строго в диапазоне 1.0% - 2.5% И открытого интереса >= +3.0%
+                    if PRICE_INCREASE_MIN <= price_change <= PRICE_INCREASE_MAX and oi_change >= OI_INCREASE_THRESHOLD:
                         last_time = last_alert_time.get(symbol, 0)
                         
                         # Проверяем, прошел ли кулдаун (10 минут)
