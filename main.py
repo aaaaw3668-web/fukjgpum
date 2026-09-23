@@ -13,9 +13,8 @@ if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
-# Пороги срабатывания (синхронный шортовый импульс)
+# Пороги срабатывания (импульс падения на аномальном объеме)
 PRICE_DROP_THRESHOLD = -2.5      # Падение цены от -2.5% и ниже
-OI_INCREASE_THRESHOLD = 1.5      # Рост OI от +3.0%
 VOLUME_Z_THRESHOLD = 2.0         # Аномалия объёма: Z-score >= 2.0 (~2 сигмы)
 
 TIME_WINDOW = 60 * 15            # Окно анализа: 15 минут (900 сек)
@@ -264,7 +263,7 @@ def fetch_all_bybit_tickers():
 
 # ==================== ОСНОВНОЙ ЦИКЛ ====================
 def main():
-    print(f"=== Запуск мониторинга (Цена <= {PRICE_DROP_THRESHOLD}%, OI >= +{OI_INCREASE_THRESHOLD}%, Z-Score объёма >= {VOLUME_Z_THRESHOLD}) ===")
+    print(f"=== Запуск мониторинга (Цена <= {PRICE_DROP_THRESHOLD}%, Z-Score объёма >= {VOLUME_Z_THRESHOLD}) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -276,7 +275,6 @@ def main():
 
     for symbol in symbols:
         historical_data[symbol] = {
-            'oi': [],
             'price': [],
             'volume_ticks': [],
             'last_turnover': None
@@ -299,7 +297,6 @@ def main():
                     continue
 
                 try:
-                    current_oi = float(ticker['openInterest'])
                     current_price = float(ticker['lastPrice'])
                     current_turnover = float(ticker.get('turnover24h', 0))
                 except (ValueError, KeyError):
@@ -317,41 +314,32 @@ def main():
                         data['volume_ticks'].append({'value': delta_vol, 'timestamp': timestamp})
                 data['last_turnover'] = current_turnover
 
-                # 1. Обновляем историю OI
-                data['oi'].append({'value': current_oi, 'timestamp': timestamp})
-                if len(data['oi']) > 30:
-                    data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
-
-                # 2. Обновляем историю цены
+                # 1. Обновляем историю цены
                 data['price'].append({'value': current_price, 'timestamp': timestamp})
                 if len(data['price']) > 30:
                     data['price'] = [x for x in data['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                # 3. Фильтруем историю тиков объёма
+                # 2. Фильтруем историю тиков объёма
                 if len(data['volume_ticks']) > 30:
                     data['volume_ticks'] = [x for x in data['volume_ticks'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                # 4. Проверка условий
-                if len(data['oi']) > 1 and len(data['price']) > 1 and len(data['volume_ticks']) >= 5:
-                    old_oi = data['oi'][0]['value']
+                # 3. Проверка условий (нужно хотя бы 2 замера цены и от 5 замеров объема для базы Z-score)
+                if len(data['price']) > 1 and len(data['volume_ticks']) >= 5:
                     old_price = data['price'][0]['value']
-
-                    oi_change = calculate_change(old_oi, current_oi)
                     price_change = calculate_change(old_price, current_price)
 
                     vol_series = [x['value'] for x in data['volume_ticks']]
                     z_score = calculate_z_score(vol_series)
 
-                    # Условие: Падение цены + Рост OI + Всплеск объёма по Z-Score >= 2
-                    if price_change <= PRICE_DROP_THRESHOLD and oi_change >= OI_INCREASE_THRESHOLD and z_score >= VOLUME_Z_THRESHOLD:
+                    # Условие: Падение цены + Всплеск объёма по Z-Score >= 2
+                    if price_change <= PRICE_DROP_THRESHOLD and z_score >= VOLUME_Z_THRESHOLD:
                         last_time = last_alert_time.get(symbol, 0)
 
                         # Проверяем кулдаун (10 минут)
                         if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
                             msg = (
-                                f"🔻 <b>{symbol}</b>: Импульс в шорт с аномальным объёмом!\n\n"
+                                f"🔻 <b>{symbol}</b>: Импульсный пролив на аномальном объёме!\n\n"
                                 f"📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>\n"
-                                f"📊 <b>Приток OI:</b> <code>+{oi_change:.2f}%</code>\n"
                                 f"🔥 <b>Z-Score объёма:</b> <code>+{z_score:.2f}σ</code>\n"
                                 f"⏱ <b>Окно анализа:</b> 15 мин."
                             )
