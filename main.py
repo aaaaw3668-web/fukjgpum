@@ -14,7 +14,7 @@ if not TELEGRAM_BOT_TOKEN:
 
 # Пороги срабатывания (синхронный шортовый импульс: падение цены + рост OI)
 PRICE_DROP_THRESHOLD = -2.5      # Падение цены от -2.5% и ниже
-OI_INCREASE_THRESHOLD = 3.0      # Рост OI от +3.0%
+OI_INCREASE_THRESHOLD = 1.5      # Рост OI от +3.0%
 
 TIME_WINDOW = 60 * 15              # Окно анализа: 15 минут (900 сек)
 COOLDOWN_MINUTES = 10             # Пауза между алертами по одной монете
