@@ -1,3 +1,4 @@
+import math
 import os
 import re
 import threading
@@ -12,13 +13,14 @@ if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
-# Пороги срабатывания (синхронный шортовый импульс: падение цены + рост OI)
+# Пороги срабатывания (синхронный шортовый импульс)
 PRICE_DROP_THRESHOLD = -2.5      # Падение цены от -2.5% и ниже
 OI_INCREASE_THRESHOLD = 1.5      # Рост OI от +3.0%
+VOLUME_Z_THRESHOLD = 2.0         # Аномалия объёма: Z-score >= 2.0 (~2 сигмы)
 
-TIME_WINDOW = 60 * 15              # Окно анализа: 15 минут (900 сек)
-COOLDOWN_MINUTES = 10             # Пауза между алертами по одной монете
-DAILY_ALERT_LIMIT = 100           # Суточный лимит уведомлений на одну монету
+TIME_WINDOW = 60 * 15            # Окно анализа: 15 минут (900 сек)
+COOLDOWN_MINUTES = 10           # Пауза между алертами по одной монете
+DAILY_ALERT_LIMIT = 100         # Суточный лимит уведомлений на одну монету
 
 # Сессия для переиспользования соединений
 session = requests.Session()
@@ -65,6 +67,18 @@ def calculate_change(old, new):
     if old == 0:
         return 0.0
     return ((new - old) / old) * 100
+
+
+def calculate_z_score(values):
+    """Считает Z-score для последнего элемента в списке"""
+    if len(values) < 5:
+        return 0.0
+    mean = sum(values) / len(values)
+    variance = sum((x - mean) ** 2 for x in values) / len(values)
+    std_dev = math.sqrt(variance)
+    if std_dev == 0:
+        return 0.0
+    return (values[-1] - mean) / std_dev
 
 
 def generate_links(symbol):
@@ -250,7 +264,7 @@ def fetch_all_bybit_tickers():
 
 # ==================== ОСНОВНОЙ ЦИКЛ ====================
 def main():
-    print("=== Запуск мониторинга (Падение цены от -2.5% И Рост OI от +3.0%) ===")
+    print(f"=== Запуск мониторинга (Цена <= {PRICE_DROP_THRESHOLD}%, OI >= +{OI_INCREASE_THRESHOLD}%, Z-Score объёма >= {VOLUME_Z_THRESHOLD}) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -261,7 +275,12 @@ def main():
         return
 
     for symbol in symbols:
-        historical_data[symbol] = {'oi': [], 'price': []}
+        historical_data[symbol] = {
+            'oi': [],
+            'price': [],
+            'volume_ticks': [],
+            'last_turnover': None
+        }
 
     print(f"✓ Мониторинг {len(symbols)} пар запущен.")
 
@@ -282,50 +301,63 @@ def main():
                 try:
                     current_oi = float(ticker['openInterest'])
                     current_price = float(ticker['lastPrice'])
+                    current_turnover = float(ticker.get('turnover24h', 0))
                 except (ValueError, KeyError):
                     continue
 
                 # Микропауза для снижения нагрузки на CPU
                 time.sleep(0.01)
 
+                data = historical_data[symbol]
+
+                # Расчёт объёма сделок за текущий такт
+                if data['last_turnover'] is not None:
+                    delta_vol = current_turnover - data['last_turnover']
+                    if delta_vol >= 0:
+                        data['volume_ticks'].append({'value': delta_vol, 'timestamp': timestamp})
+                data['last_turnover'] = current_turnover
+
                 # 1. Обновляем историю OI
-                historical_data[symbol]['oi'].append({'value': current_oi, 'timestamp': timestamp})
-                if len(historical_data[symbol]['oi']) > 30:
-                    historical_data[symbol]['oi'] = [
-                        x for x in historical_data[symbol]['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW
-                    ]
+                data['oi'].append({'value': current_oi, 'timestamp': timestamp})
+                if len(data['oi']) > 30:
+                    data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
                 # 2. Обновляем историю цены
-                historical_data[symbol]['price'].append({'value': current_price, 'timestamp': timestamp})
-                if len(historical_data[symbol]['price']) > 30:
-                    historical_data[symbol]['price'] = [
-                        x for x in historical_data[symbol]['price'] if timestamp - x['timestamp'] <= TIME_WINDOW
-                    ]
+                data['price'].append({'value': current_price, 'timestamp': timestamp})
+                if len(data['price']) > 30:
+                    data['price'] = [x for x in data['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                # 3. Проверка изменения данных за окно TIME_WINDOW
-                if len(historical_data[symbol]['oi']) > 1 and len(historical_data[symbol]['price']) > 1:
-                    old_oi = historical_data[symbol]['oi'][0]['value']
-                    old_price = historical_data[symbol]['price'][0]['value']
+                # 3. Фильтруем историю тиков объёма
+                if len(data['volume_ticks']) > 30:
+                    data['volume_ticks'] = [x for x in data['volume_ticks'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+
+                # 4. Проверка условий
+                if len(data['oi']) > 1 and len(data['price']) > 1 and len(data['volume_ticks']) >= 5:
+                    old_oi = data['oi'][0]['value']
+                    old_price = data['price'][0]['value']
 
                     oi_change = calculate_change(old_oi, current_oi)
                     price_change = calculate_change(old_price, current_price)
 
-                    # Условие: Одновременное падение цены <= -2.5% И рост открытого интереса >= +3.0%
-                    if price_change <= PRICE_DROP_THRESHOLD and oi_change >= OI_INCREASE_THRESHOLD:
+                    vol_series = [x['value'] for x in data['volume_ticks']]
+                    z_score = calculate_z_score(vol_series)
+
+                    # Условие: Падение цены + Рост OI + Всплеск объёма по Z-Score >= 2
+                    if price_change <= PRICE_DROP_THRESHOLD and oi_change >= OI_INCREASE_THRESHOLD and z_score >= VOLUME_Z_THRESHOLD:
                         last_time = last_alert_time.get(symbol, 0)
-                        
-                        # Проверяем, прошел ли кулдаун (10 минут)
+
+                        # Проверяем кулдаун (10 минут)
                         if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
                             msg = (
-                                f"🔻 <b>{symbol}</b>: Набор позиций / Вливание в шорт\n\n"
+                                f"🔻 <b>{symbol}</b>: Импульс в шорт с аномальным объёмом!\n\n"
                                 f"📉 <b>Падение цены:</b> <code>{price_change:.2f}%</code>\n"
                                 f"📊 <b>Приток OI:</b> <code>+{oi_change:.2f}%</code>\n"
-                                f"⏱ <b>Интервал:</b> последние 15 мин."
+                                f"🔥 <b>Z-Score объёма:</b> <code>+{z_score:.2f}σ</code>\n"
+                                f"⏱ <b>Окно анализа:</b> 15 мин."
                             )
                             for chat_id in list(users.keys()):
                                 send_telegram_notification(chat_id, msg, symbol)
 
-                            # Обновляем время отправки алерта по символу
                             last_alert_time[symbol] = timestamp
 
             # Пауза между полными обходами рынка
