@@ -15,7 +15,7 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # --- Настройки для LONG (Рост цены + Рост ОИ) ---
-LONG_PRICE_PUMP_THRESHOLD = 2.5   # Рост цены от Low за окно на 2.5% и более
+LONG_PRICE_PUMP_THRESHOLD = 1   # Рост цены от Low за окно на 2.5% и более
 LONG_MIN_OI_GROWTH_PCT = 2.5      # Рост ОИ от Low за окно на 2.5% и более
 
 # --- Общие параметры ---
