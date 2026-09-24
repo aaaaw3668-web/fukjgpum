@@ -13,12 +13,11 @@ if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
-# Пороги срабатывания (импульс падения на аномальном объеме)
+# Пороги срабатывания
 PRICE_DROP_THRESHOLD = -2.5      # Падение цены от -2.5% и ниже
-VOLUME_Z_THRESHOLD = 2.0         # Аномалия объёма: Z-score >= 2.0 (~2 сигмы)
 
-# Новые условия: тренд и ОИ
-MIN_OI_GROWTH_PCT = 2.5          # Рост открытого интереса от +1.0%
+# Условия: тренд и ОИ
+MIN_OI_GROWTH_PCT = 2.5          # Рост открытого интереса от +2.5%
 REQUIRE_24H_DOWNTREND = False     # Требовать суточный нисходящий тренд (< 0%)
 
 TIME_WINDOW = 60 * 15            # Окно анализа: 15 минут (900 сек)
@@ -70,18 +69,6 @@ def calculate_change(old, new):
     if old == 0:
         return 0.0
     return ((new - old) / old) * 100
-
-
-def calculate_z_score(values):
-    """Считает Z-score для последнего элемента в списке"""
-    if len(values) < 5:
-        return 0.0
-    mean = sum(values) / len(values)
-    variance = sum((x - mean) ** 2 for x in values) / len(values)
-    std_dev = math.sqrt(variance)
-    if std_dev == 0:
-        return 0.0
-    return (values[-1] - mean) / std_dev
 
 
 def generate_links(symbol):
@@ -267,7 +254,7 @@ def fetch_all_bybit_tickers():
 
 # ==================== ОСНОВНОЙ ЦИКЛ ====================
 def main():
-    print(f"=== Запуск мониторинга (Цена <= {PRICE_DROP_THRESHOLD}%, Z-Score >= {VOLUME_Z_THRESHOLD}, Рост ОИ >= +{MIN_OI_GROWTH_PCT}%, Тренд 24h < 0) ===")
+    print(f"=== Запуск мониторинга (Цена <= {PRICE_DROP_THRESHOLD}%, Рост ОИ >= +{MIN_OI_GROWTH_PCT}%) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -280,9 +267,7 @@ def main():
     for symbol in symbols:
         historical_data[symbol] = {
             'price': [],
-            'volume_ticks': [],
-            'oi': [],
-            'last_turnover': None
+            'oi': []
         }
 
     print(f"✓ Мониторинг {len(symbols)} пар запущен.")
@@ -303,8 +288,7 @@ def main():
 
                 try:
                     current_price = float(ticker['lastPrice'])
-                    current_turnover = float(ticker.get('turnover24h', 0))
-                    # Изменение цены за 24 часа (Bybit возвращает в долях, например -0.0512 = -5.12%)
+                    # Изменение цены за 24 часа
                     price_change_24h = float(ticker.get('price24hPcnt', 0)) * 100
                     current_oi = float(ticker.get('openInterest', 0))
                 except (ValueError, KeyError):
@@ -314,13 +298,6 @@ def main():
                 time.sleep(0.01)
 
                 data = historical_data[symbol]
-
-                # Расчёт объёма сделок за текущий такт
-                if data['last_turnover'] is not None:
-                    delta_vol = current_turnover - data['last_turnover']
-                    if delta_vol >= 0:
-                        data['volume_ticks'].append({'value': delta_vol, 'timestamp': timestamp})
-                data['last_turnover'] = current_turnover
 
                 # 1. Обновляем историю цены
                 data['price'].append({'value': current_price, 'timestamp': timestamp})
@@ -333,12 +310,8 @@ def main():
                     if len(data['oi']) > 30:
                         data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                # 3. Фильтруем историю тиков объёма
-                if len(data['volume_ticks']) > 30:
-                    data['volume_ticks'] = [x for x in data['volume_ticks'] if timestamp - x['timestamp'] <= TIME_WINDOW]
-
-                # 4. Проверка условий
-                if len(data['price']) > 1 and len(data['volume_ticks']) >= 5 and len(data['oi']) > 1:
+                # 3. Проверка условий
+                if len(data['price']) > 1 and len(data['oi']) > 1:
                     # Фильтр 1: Нисходящий суточный тренд (цена за 24ч должна падать)
                     if REQUIRE_24H_DOWNTREND and price_change_24h >= 0:
                         continue
@@ -347,17 +320,12 @@ def main():
                     old_price = data['price'][0]['value']
                     price_change = calculate_change(old_price, current_price)
 
-                    # Фильтр 3: Аномалия объема через Z-Score
-                    vol_series = [x['value'] for x in data['volume_ticks']]
-                    z_score = calculate_z_score(vol_series)
-
-                    # Фильтр 4: Рост открытого интереса в окне TIME_WINDOW на +1% и выше
+                    # Фильтр 3: Рост открытого интереса в окне TIME_WINDOW на +2.5% и выше
                     old_oi = data['oi'][0]['value']
                     oi_change = calculate_change(old_oi, current_oi)
 
-                    # Проверка всех условий вместе
+                    # Проверка условий
                     if (price_change <= PRICE_DROP_THRESHOLD and 
-                        z_score >= VOLUME_Z_THRESHOLD and 
                         oi_change >= MIN_OI_GROWTH_PCT):
 
                         last_time = last_alert_time.get(symbol, 0)
@@ -369,7 +337,6 @@ def main():
                                 f"📉 <b>Тренд 24h:</b> <code>{price_change_24h:.2f}%</code>\n"
                                 f"📉 <b>Падение цены (15м):</b> <code>{price_change:.2f}%</code>\n"
                                 f"📈 <b>Рост ОИ (15м):</b> <code>+{oi_change:.2f}%</code>\n"
-                                f"🔥 <b>Z-Score объёма:</b> <code>+{z_score:.2f}σ</code>\n"
                                 f"⏱ <b>Окно анализа:</b> 15 мин."
                             )
                             for chat_id in list(users.keys()):
