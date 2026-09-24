@@ -16,7 +16,7 @@ if not TELEGRAM_BOT_TOKEN:
 
 # --- Настройки для LONG (Рост цены + Рост ОИ) ---
 LONG_PRICE_PUMP_THRESHOLD = 2.5   # Рост цены от Low за окно на 2.5% и более
-LONG_MIN_OI_GROWTH_PCT = 3      # Рост ОИ от Low за окно на 2.5% и более
+LONG_MIN_OI_GROWTH_PCT = 2.5      # Рост ОИ от Low за окно на 2.5% и более
 
 # --- Общие параметры ---
 TIME_WINDOW = 60 * 5              # Окно анализа: 5 минут (300 сек)
@@ -367,7 +367,7 @@ def main():
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
-
+=
     symbols = fetch_perpetual_symbols()
     if not symbols:
         print("✗ Ошибка: нет символов.")
@@ -378,3 +378,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
