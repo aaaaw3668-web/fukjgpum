@@ -14,13 +14,13 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # Пороги срабатывания
-PRICE_DROP_THRESHOLD = -2.5      # Падение цены от -2.5% и ниже
+PRICE_DROP_THRESHOLD = -2.5      # Падение цены от МАКСИМУМА за окно на -2.5% и ниже
 
 # Условия: тренд и ОИ
-MIN_OI_GROWTH_PCT = 2.5          # Рост открытого интереса от +2.5%
+MIN_OI_GROWTH_PCT = 2.5          # Рост открытого интереса от МИНИМУМА за окно на +2.5% и выше
 REQUIRE_24H_DOWNTREND = False     # Требовать суточный нисходящий тренд (< 0%)
 
-TIME_WINDOW = 60 * 1            # Окно анализа: 15 минут (900 сек)
+TIME_WINDOW = 60 * 5             # Окно анализа: 5 минут (300 сек)
 COOLDOWN_MINUTES = 10           # Пауза между алертами по одной монете
 DAILY_ALERT_LIMIT = 100         # Суточный лимит уведомлений на одну монету
 
@@ -254,7 +254,7 @@ def fetch_all_bybit_tickers():
 
 # ==================== ОСНОВНОЙ ЦИКЛ ====================
 def main():
-    print(f"=== Запуск мониторинга (Цена <= {PRICE_DROP_THRESHOLD}%, Рост ОИ >= +{MIN_OI_GROWTH_PCT}%) ===")
+    print(f"=== Запуск мониторинга (Окно: 5м | Падение от High <= {PRICE_DROP_THRESHOLD}% | Рост ОИ от Low >= +{MIN_OI_GROWTH_PCT}%) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
@@ -276,7 +276,7 @@ def main():
         try:
             tickers = fetch_all_bybit_tickers()
             if not tickers:
-                time.sleep(15)
+                time.sleep(10)
                 continue
 
             timestamp = int(datetime.now().timestamp())
@@ -294,37 +294,32 @@ def main():
                 except (ValueError, KeyError):
                     continue
 
-                # Микропауза для снижения нагрузки на CPU
-                time.sleep(0.01)
-
                 data = historical_data[symbol]
 
                 # 1. Обновляем историю цены
                 data['price'].append({'value': current_price, 'timestamp': timestamp})
-                if len(data['price']) > 30:
-                    data['price'] = [x for x in data['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+                data['price'] = [x for x in data['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
                 # 2. Обновляем историю открытого интереса (OI)
                 if current_oi > 0:
                     data['oi'].append({'value': current_oi, 'timestamp': timestamp})
-                    if len(data['oi']) > 30:
-                        data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+                    data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-                # 3. Проверка условий
+                # 3. Проверка условий (нужно хотя бы пару точек в истории)
                 if len(data['price']) > 1 and len(data['oi']) > 1:
-                    # Фильтр 1: Нисходящий суточный тренд (цена за 24ч должна падать)
+                    # Фильтр 1: Нисходящий суточный тренд
                     if REQUIRE_24H_DOWNTREND and price_change_24h >= 0:
                         continue
 
-                    # Фильтр 2: Падение цены в окне TIME_WINDOW (15 мин)
-                    old_price = data['price'][0]['value']
-                    price_change = calculate_change(old_price, current_price)
+                    # Фильтр 2: Падение цены ОТ МАКСИМУМА за последние 5 минут
+                    max_price = max(x['value'] for x in data['price'])
+                    price_change = calculate_change(max_price, current_price)
 
-                    # Фильтр 3: Рост открытого интереса в окне TIME_WINDOW на +2.5% и выше
-                    old_oi = data['oi'][0]['value']
-                    oi_change = calculate_change(old_oi, current_oi)
+                    # Фильтр 3: Рост открытого интереса ОТ МИНИМУМА за последние 5 минут
+                    min_oi = min(x['value'] for x in data['oi'])
+                    oi_change = calculate_change(min_oi, current_oi)
 
-                    # Проверка условий
+                    # Проверка основных условий
                     if (price_change <= PRICE_DROP_THRESHOLD and 
                         oi_change >= MIN_OI_GROWTH_PCT):
 
@@ -333,23 +328,23 @@ def main():
                         # Проверяем кулдаун (10 минут)
                         if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
                             msg = (
-                                f"🔻 <b>{symbol}</b>: Импульсный пролив в нисходящем тренде!\n\n"
-                                f"📉 <b>Тренд 24h:</b> <code>{price_change_24h:.2f}%</code>\n"
-                                f"📉 <b>Падение цены (15м):</b> <code>{price_change:.2f}%</code>\n"
-                                f"📈 <b>Рост ОИ (15м):</b> <code>+{oi_change:.2f}%</code>\n"
-                                f"⏱ <b>Окно анализа:</b> 15 мин."
+                                f"🔻 <b>{symbol}</b>: Импульсный пролив от локального пика!\n\n"
+                                f"📉 <b>Падение от High (5м):</b> <code>{price_change:.2f}%</code>\n"
+                                f"📈 <b>Рост ОИ от Low (5м):</b> <code>+{oi_change:.2f}%</code>\n"
+                                f"📊 <b>Тренд 24h:</b> <code>{price_change_24h:.2f}%</code>\n"
+                                f"⏱ <b>Окно анализа:</b> 5 мин."
                             )
                             for chat_id in list(users.keys()):
                                 send_telegram_notification(chat_id, msg, symbol)
 
                             last_alert_time[symbol] = timestamp
 
-            # Пауза между полными обходами рынка
-            time.sleep(15)
+            # Пауза между обходами рынка (10 секунд достаточно)
+            time.sleep(10)
 
         except Exception as e:
             print(f"✗ Ошибка основного цикла: {e}")
-            time.sleep(15)
+            time.sleep(10)
 
 
 if __name__ == "__main__":
