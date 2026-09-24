@@ -1,4 +1,4 @@
-import math
+import json
 import os
 import re
 import threading
@@ -6,23 +6,25 @@ import time
 import urllib.parse
 from datetime import datetime, timedelta, timezone
 import requests
+import websocket
 
-# ==================== НАСТРОЙКИ ====================
+# ==================== НАСТРОЙКИ (ТОЛЬКО LONG) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
-# Пороги срабатывания
-PRICE_DROP_THRESHOLD = -2.5      # Падение цены от МАКСИМУМА за окно на -2.5% и ниже
+# --- Настройки для LONG (Рост цены + Рост ОИ) ---
+LONG_PRICE_PUMP_THRESHOLD = 2.5   # Рост цены от Low за окно на 2.5% и более
+LONG_MIN_OI_GROWTH_PCT = 3      # Рост ОИ от Low за окно на 2.5% и более
 
-# Условия: тренд и ОИ
-MIN_OI_GROWTH_PCT = 5          # Рост открытого интереса от МИНИМУМА за окно на +2.5% и выше
-REQUIRE_24H_DOWNTREND = False     # Требовать суточный нисходящий тренд (< 0%)
+# --- Общие параметры ---
+TIME_WINDOW = 60 * 5              # Окно анализа: 5 минут (300 сек)
+COOLDOWN_MINUTES = 10            # Пауза между алертами по одной монете
+DAILY_ALERT_LIMIT = 100          # Суточный лимит уведомлений на одну монету
 
-TIME_WINDOW = 60 * 5             # Окно анализа: 5 минут (300 сек)
-COOLDOWN_MINUTES = 10           # Пауза между алертами по одной монете
-DAILY_ALERT_LIMIT = 100         # Суточный лимит уведомлений на одну монету
+# URL WebSocket Bybit (Linear Perpetuals)
+BYBIT_WS_URL = "wss://stream.bybit.com/v5/public/linear"
 
 # Сессия для переиспользования соединений
 session = requests.Session()
@@ -37,7 +39,11 @@ users = {
 
 # Хранилище истории и временных меток алертов
 historical_data = {}
-last_alert_time = {}              # { 'BTCUSDT': timestamp_последней_отправки }
+last_alert_time = {}              # { 'BTCUSDT_LONG': timestamp }
+symbol_24h_change = {}            # { 'BTCUSDT': float_изменения_за_24h }
+
+# Блокировка для безопасной работы с потоками
+data_lock = threading.Lock()
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -159,7 +165,7 @@ def handle_telegram_updates():
                         welcome_url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': f"✅ <b>Вы успешно подписались!</b>\nЛимит: <b>{DAILY_ALERT_LIMIT} в сутки</b>.\n⏰ Сброс лимитов в 5:00 по Уфимскому времени.",
+                            'text': f"✅ <b>Бот (ТОЛЬКО LONG с ростом ОИ) запущен!</b>\nЛимит: <b>{DAILY_ALERT_LIMIT} в сутки</b>.",
                             'parse_mode': 'HTML'
                         }
                         try:
@@ -195,33 +201,25 @@ def check_and_reset_at_midnight():
     if now >= reset_time:
         reset_time = reset_time + timedelta(days=1)
 
-    print(f"⏰ Следующий сброс лимитов в: {reset_time.strftime('%Y-%m-%d %H:%M:%S')} (Уфимское время)")
-
     while True:
         try:
             now = get_ye_time()
             if now >= reset_time:
-                print(f"⏰ Наступило 5 утра по Уфимскому времени ({now}). Сброс лимитов...")
-
                 for chat_id in users:
                     users[chat_id]['alert_counts'] = {}
 
-                reset_message = (
-                    "🔄 <b>Внимание! Наступило 5:00 по Уфимскому времени.</b>\n"
-                    f"Суточные лимиты уведомлений (<code>{DAILY_ALERT_LIMIT}</code> на монету) успешно сброшены!"
-                )
+                reset_message = "🔄 <b>Сброс суточных лимитов завершен!</b>"
                 broadcast_message(reset_message)
 
                 reset_time = reset_time + timedelta(days=1)
-                print(f"⏰ Следующий сброс лимитов в: {reset_time.strftime('%Y-%m-%d %H:%M:%S')} (Уфимское время)")
 
             time.sleep(30)
         except Exception as e:
-            print(f"✗ Ошибка в потоке сброса лимитов: {e}")
+            print(f"✗ Ошибка сброса лимитов: {e}")
             time.sleep(30)
 
 
-# ==================== РАБОТА С BYBIT API ====================
+# ==================== ВСПОМОГАТЕЛЬНЫЙ REST ====================
 def fetch_perpetual_symbols():
     url = "https://api.bybit.com/v5/market/instruments-info"
     params = {"category": "linear"}
@@ -238,113 +236,144 @@ def fetch_perpetual_symbols():
     return []
 
 
-def fetch_all_bybit_tickers():
-    url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": "linear"}
+# ==================== ОБРАБОТКА WEBSOCKET ДАННЫХ ====================
+def process_ticker_update(symbol, data_payload):
+    """Обработка ТОЛЬКО LONG сигналов (рост цены + рост ОИ)"""
+    timestamp = int(datetime.now().timestamp())
+
+    with data_lock:
+        if symbol not in historical_data:
+            historical_data[symbol] = {'price': [], 'oi': []}
+            
+        data = historical_data[symbol]
+
+        if 'price24hPcnt' in data_payload:
+            try:
+                symbol_24h_change[symbol] = float(data_payload['price24hPcnt']) * 100
+            except ValueError:
+                pass
+
+        if 'lastPrice' in data_payload:
+            try:
+                current_price = float(data_payload['lastPrice'])
+                data['price'].append({'value': current_price, 'timestamp': timestamp})
+            except ValueError:
+                pass
+
+        if 'openInterest' in data_payload:
+            try:
+                current_oi = float(data_payload['openInterest'])
+                if current_oi > 0:
+                    data['oi'].append({'value': current_oi, 'timestamp': timestamp})
+            except ValueError:
+                pass
+
+        # Очистка устаревших данных (старше TIME_WINDOW)
+        data['price'] = [x for x in data['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+        data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
+
+        # ПРОВЕРКА УСЛОВИЙ
+        if len(data['price']) > 1 and len(data['oi']) > 1:
+            price_change_24h = symbol_24h_change.get(symbol, 0.0)
+            current_price = data['price'][-1]['value']
+            current_oi = data['oi'][-1]['value']
+
+            min_price = min(x['value'] for x in data['price'])
+            min_oi = min(x['value'] for x in data['oi'])
+
+            # ---------------- ПРОВЕРКА LONG (Рост цены от Low + Рост ОИ от Low) ----------------
+            long_price_pump = calculate_change(min_price, current_price)
+            long_oi_growth = calculate_change(min_oi, current_oi)
+
+            if long_price_pump >= LONG_PRICE_PUMP_THRESHOLD and long_oi_growth >= LONG_MIN_OI_GROWTH_PCT:
+                long_key = f"{symbol}_LONG"
+                last_time = last_alert_time.get(long_key, 0)
+
+                if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
+                    msg = (
+                        f"🚀 <b>{symbol}</b>: Памп / Набор ЛОНГА!\n\n"
+                        f"📈 <b>Рост от Low (5м):</b> <code>+{long_price_pump:.2f}%</code>\n"
+                        f"📈 <b>Рост ОИ от Low (5м):</b> <code>+{long_oi_growth:.2f}%</code>\n"
+                        f"📊 <b>Тренд 24h:</b> <code>{price_change_24h:.2f}%</code>\n"
+                        f"⏱ <b>Окно анализа:</b> 5 мин."
+                    )
+                    
+                    threading.Thread(
+                        target=send_to_all_users, 
+                        args=(msg, symbol), 
+                        daemon=True
+                    ).start()
+
+                    last_alert_time[long_key] = timestamp
+
+
+def send_to_all_users(msg, symbol):
+    for chat_id in list(users.keys()):
+        send_telegram_notification(chat_id, msg, symbol)
+
+
+# ==================== WEBSOCKET КЛИЕНТ ====================
+def on_message(ws, message):
     try:
-        response = session.get(url, params=params, timeout=15)
-        if response.status_code == 200:
-            data = response.json()
-            if data['retCode'] == 0:
-                return data['result']['list']
+        data = json.loads(message)
+        if "topic" in data and data["topic"].startswith("tickers."):
+            symbol = data["topic"].split(".")[1]
+            ticker_data = data.get("data", {})
+            process_ticker_update(symbol, ticker_data)
     except Exception as e:
-        print(f"✗ Ошибка получения тикеров Bybit: {e}")
-    return []
+        print(f"✗ Ошибка обработки WS: {e}")
 
 
-# ==================== ОСНОВНОЙ ЦИКЛ ====================
+def on_error(ws, error):
+    print(f"✗ WS Ошибка: {error}")
+
+
+def on_close(ws, close_status_code, close_msg):
+    print(f"⚠ WS Закрыто. Переподключение через 5 сек...")
+    time.sleep(5)
+    start_websocket_client(symbols_list)
+
+
+def on_open(ws):
+    print("✓ WS Соединение установлено. Отправка подписок...")
+    batch_size = 10
+    for i in range(0, len(symbols_list), batch_size):
+        chunk = symbols_list[i:i + batch_size]
+        topics = [f"tickers.{sym}" for sym in chunk]
+        
+        ws.send(json.dumps({"op": "subscribe", "args": topics}))
+        time.sleep(0.05)
+        
+    print(f"✓ Подписались на {len(symbols_list)} тикеров!")
+
+
+def start_websocket_client(symbols):
+    global symbols_list
+    symbols_list = symbols
+    
+    ws = websocket.WebSocketApp(
+        BYBIT_WS_URL,
+        on_open=on_open,
+        on_message=on_message,
+        on_error=on_error,
+        on_close=on_close
+    )
+    ws.run_forever(ping_interval=20, ping_timeout=10)
+
+
+# ==================== MAIN ====================
 def main():
-    print(f"=== Запуск мониторинга (Окно: 5м | Падение от High <= {PRICE_DROP_THRESHOLD}% | Рост ОИ от Low >= +{MIN_OI_GROWTH_PCT}%) ===")
+    print("=== Запуск LONG мониторинга (Сигналы с ростом цены и ОИ) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
 
     symbols = fetch_perpetual_symbols()
     if not symbols:
-        print("✗ Критическая ошибка: список символов пуст.")
+        print("✗ Ошибка: нет символов.")
         return
 
-    for symbol in symbols:
-        historical_data[symbol] = {
-            'price': [],
-            'oi': []
-        }
-
-    print(f"✓ Мониторинг {len(symbols)} пар запущен.")
-
-    while True:
-        try:
-            tickers = fetch_all_bybit_tickers()
-            if not tickers:
-                time.sleep(10)
-                continue
-
-            timestamp = int(datetime.now().timestamp())
-
-            for ticker in tickers:
-                symbol = ticker['symbol']
-                if symbol not in historical_data:
-                    continue
-
-                try:
-                    current_price = float(ticker['lastPrice'])
-                    # Изменение цены за 24 часа
-                    price_change_24h = float(ticker.get('price24hPcnt', 0)) * 100
-                    current_oi = float(ticker.get('openInterest', 0))
-                except (ValueError, KeyError):
-                    continue
-
-                data = historical_data[symbol]
-
-                # 1. Обновляем историю цены
-                data['price'].append({'value': current_price, 'timestamp': timestamp})
-                data['price'] = [x for x in data['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
-
-                # 2. Обновляем историю открытого интереса (OI)
-                if current_oi > 0:
-                    data['oi'].append({'value': current_oi, 'timestamp': timestamp})
-                    data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
-
-                # 3. Проверка условий (нужно хотя бы пару точек в истории)
-                if len(data['price']) > 1 and len(data['oi']) > 1:
-                    # Фильтр 1: Нисходящий суточный тренд
-                    if REQUIRE_24H_DOWNTREND and price_change_24h >= 0:
-                        continue
-
-                    # Фильтр 2: Падение цены ОТ МАКСИМУМА за последние 5 минут
-                    max_price = max(x['value'] for x in data['price'])
-                    price_change = calculate_change(max_price, current_price)
-
-                    # Фильтр 3: Рост открытого интереса ОТ МИНИМУМА за последние 5 минут
-                    min_oi = min(x['value'] for x in data['oi'])
-                    oi_change = calculate_change(min_oi, current_oi)
-
-                    # Проверка основных условий
-                    if (price_change <= PRICE_DROP_THRESHOLD and 
-                        oi_change >= MIN_OI_GROWTH_PCT):
-
-                        last_time = last_alert_time.get(symbol, 0)
-
-                        # Проверяем кулдаун (10 минут)
-                        if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
-                            msg = (
-                                f"🔻 <b>{symbol}</b>: Импульсный пролив от локального пика!\n\n"
-                                f"📉 <b>Падение от High (5м):</b> <code>{price_change:.2f}%</code>\n"
-                                f"📈 <b>Рост ОИ от Low (5м):</b> <code>+{oi_change:.2f}%</code>\n"
-                                f"📊 <b>Тренд 24h:</b> <code>{price_change_24h:.2f}%</code>\n"
-                                f"⏱ <b>Окно анализа:</b> 5 мин."
-                            )
-                            for chat_id in list(users.keys()):
-                                send_telegram_notification(chat_id, msg, symbol)
-
-                            last_alert_time[symbol] = timestamp
-
-            # Пауза между обходами рынка (10 секунд достаточно)
-            time.sleep(10)
-
-        except Exception as e:
-            print(f"✗ Ошибка основного цикла: {e}")
-            time.sleep(10)
+    start_websocket_client(symbols)
 
 
 if __name__ == "__main__":
