@@ -14,7 +14,7 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # --- Настройки условия сигнала ---
-LONG_PRICE_PUMP_THRESHOLD = 1.3   # Рост цены от Low за 5 мин (в %)
+LONG_PRICE_PUMP_THRESHOLD = 0.5   # Рост цены от Low за 5 мин (в %)
 LONG_MIN_OI_GROWTH_PCT = 1.2      # Рост ОИ от Low за 5 мин (в %)
 
 # --- Параметры опроса API и контроля ---
