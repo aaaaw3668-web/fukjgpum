@@ -14,8 +14,8 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # --- Условия сигнала ---
-LONG_PRICE_PUMP_THRESHOLD = 2.5   # Рост цены от Low за 5 мин (в %)
-LONG_MIN_OI_GROWTH_PCT = 2.5      # Рост ОИ от Low за 5 мин (в %)
+LONG_PRICE_PUMP_THRESHOLD = 1   # Рост цены от Low за 5 мин (в %)
+LONG_MIN_OI_GROWTH_PCT = 5      # Рост ОИ от Low за 5 мин (в %)
 
 # --- Фильтр ликвидности ---
 MIN_24H_VOLUME_USDT = 5_000_000   # Минимальный оборот за 24 часа (5 млн USDT)
