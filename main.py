@@ -18,6 +18,27 @@ LONG_PRICE_PUMP_THRESHOLD = 0.5   # Рост цены от Low за 5 мин (в
 LONG_MIN_OI_GROWTH_PCT = 0.5      # Рост ОИ от Low за 5 мин (в %)
 MAX_24H_TREND_PCT = 5.0           # Верхний лимит 24h тренда (в %). Выше 5% сигналы не отправляются.
 
+# --- Черный список традиционных активов (Акции, ETF, CFD на Bybit) ---
+STOCKS_TICKERS = [
+    # Финансы и Банки
+    'MTB', 'COF', 'KKR', 'TFC', 'USB', 'FITB', 'RF', 'BEN', 'MS', 'PGR', 'AFG', 'TROW', 'CIM', 'MFA', 'SOFI', 'UPST', 'INTU', 'HDB', 'BBD',
+    # Технологии, Полупроводники и Софт
+    'NVDA', 'AAPL', 'MSFT', 'GOOG', 'AMZN', 'META', 'TSLA', 'AMD', 'ADBE', 'MRVL', 'QCOM', 'SNPS', 'CRWD', 'DDOG', 'TXN', 'FTNT', 'OKTA', 'TWLO', 'BOX', 'JBL', 'HPE', 'DELL', 'NTAP', 'CDNS', 'SMCI', 'ARM', 'NBIS', 'SONY', 'BB', 'SKHY', 'AXTI', 'QNT', 'CBRS',
+    # Потребительский сектор и Ритейл
+    'COST', 'WMT', 'YUM', 'YUMC', 'WEN', 'KHC', 'MO', 'ULTA', 'ROST', 'DLTR', 'BBWI', 'MAT', 'DKNG', 'RCL', 'LYFT', 'GRAB', 'MELI', 'BMBL', 'BYND', 'SIG', 'HTHT',
+    # Здравоохранение и Биотех
+    'MRK', 'ABT', 'BSX', 'DHR', 'VRTX', 'REGN', 'AMGN', 'GILD', 'INCY', 'ILMN', 'HCA', 'MCK', 'CAH', 'MOH',
+    # Промышленность, Энергия и Сырье
+    'GEV', 'HON', 'UPS', 'DAL', 'PCAR', 'IR', 'ITW', 'SWK', 'GNRC', 'NOC', 'WM', 'RSG', 'VMC', 'SHW', 'IP', 'XEL', 'SRE', 'PEG', 'PPL', 'OXY', 'CTRA', 'APA', 'LYB', 'EMN', 'WPM', 'NEM', 'FCEL', 'FLNC',
+    # Медиа, Телеком и Прочее
+    'NFLX', 'TMUS', 'SPGI', 'ACN', 'BKNG', 'TRV', 'MET', 'LPL', 'NWS', 'FOX', 'RBLX', 'ROKU', 'SNAP', 'PENN', 'LAUR', 'DXC', 'SPCE', 'RKLB', 'EC', 'ICL', 'LBTYK', 'TME',
+    # ETF
+    'SPY', 'QQQ', 'IWM', 'URNM', 'UVXY', 'SQQQ', 'SOXL', 'KORU', 'DRAM', 'PSA'
+]
+
+# Создаем множество для быстрой проверки (включая чистый символ и символ + USDT)
+EXCLUDED_STOCKS = set(STOCKS_TICKERS) | {f"{t}USDT" for t in STOCKS_TICKERS}
+
 # --- Параметры опроса API и контроля ---
 TIME_WINDOW = 60 * 3              # Окно анализа: 5 минут (300 сек)
 POLL_INTERVAL = 10                # Частота запросов к API Bybit (раз в 10 секунд)
@@ -152,7 +173,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': f"✅ <b>Бот мониторинга LONG (Рост цены + Рост ОИ) запущен!</b>",
+                            'text': f"✅ <b>Бот мониторинга LONG (Крипта: Рост цены + Рост ОИ) запущен!</b>",
                             'parse_mode': 'HTML'
                         }
                         session.post(url_send, json=payload)
@@ -217,6 +238,10 @@ def process_market_data(tickers):
         for ticker in tickers:
             symbol = ticker.get('symbol', '')
             if not symbol.endswith('USDT'):
+                continue
+
+            # Исключаем акции, ETF и CFD продукты
+            if symbol in EXCLUDED_STOCKS:
                 continue
 
             try:
