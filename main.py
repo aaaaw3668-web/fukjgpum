@@ -7,15 +7,18 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 import requests
 
-# ==================== НАСТРОЙКИ (ТОЛЬКО LONG) ====================
+# ==================== НАСТРОЙКИ (LONG + ФИЛЬТР ОБЪЕМА) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
-# --- Настройки условия сигнала ---
-LONG_PRICE_PUMP_THRESHOLD = 1   # Рост цены от Low за 5 мин (в %)
-LONG_MIN_OI_GROWTH_PCT = 5      # Рост ОИ от Low за 5 мин (в %)
+# --- Условия сигнала ---
+LONG_PRICE_PUMP_THRESHOLD = 2.5   # Рост цены от Low за 5 мин (в %)
+LONG_MIN_OI_GROWTH_PCT = 2.5      # Рост ОИ от Low за 5 мин (в %)
+
+# --- Фильтр ликвидности ---
+MIN_24H_VOLUME_USDT = 5_000_000   # Минимальный оборот за 24 часа (5 млн USDT)
 
 # --- Параметры опроса API и контроля ---
 TIME_WINDOW = 60 * 5              # Окно анализа: 5 минут (300 сек)
@@ -36,7 +39,7 @@ users = {
     }
 }
 
-# Хранилище свеч/истории
+# Хранилище истории и временных меток
 historical_data = {}              # { 'BTCUSDT': { 'price': [...], 'oi': [...] } }
 last_alert_time = {}              # { 'BTCUSDT': timestamp }
 data_lock = threading.Lock()
@@ -127,7 +130,7 @@ def send_telegram_notification(chat_id, message, symbol):
 
 
 def handle_telegram_updates():
-    """Простой Long Polling для команд /start и /stats"""
+    """Обработка команд /start и /stats"""
     last_update_id = 0
     while True:
         try:
@@ -151,7 +154,11 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': f"✅ <b>Бот мониторинга LONG (Рост цены + Рост ОИ) запущен!</b>",
+                            'text': (
+                                f"✅ <b>Бот LONG мониторинга запущен!</b>\n"
+                                f"• Условие: Рост цены (+{LONG_PRICE_PUMP_THRESHOLD}%) + Рост ОИ (+{LONG_MIN_OI_GROWTH_PCT}%)\n"
+                                f"• Фильтр: Оборот за 24ч от <b>${MIN_24H_VOLUME_USDT / 1_000_000:.1f}M</b>"
+                            ),
                             'parse_mode': 'HTML'
                         }
                         session.post(url_send, json=payload)
@@ -168,7 +175,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         session.post(url_send, json={'chat_id': chat_id, 'text': stats_text, 'parse_mode': 'HTML'})
             time.sleep(2)
-        except Exception as e:
+        except Exception:
             time.sleep(5)
 
 
@@ -194,7 +201,7 @@ def check_and_reset_at_midnight():
 
 # ==================== РАБОТА С REST API BYBIT ====================
 def fetch_tickers_data():
-    """Получает текущие цены, 24h изменение и Открытый Интерес по всем монетам через один REST-запрос"""
+    """Получает цены, изменение за 24ч, ОИ и оборот в USDT по всем монетам"""
     url = "https://api.bybit.com/v5/market/tickers"
     params = {"category": "linear"}
     try:
@@ -209,7 +216,7 @@ def fetch_tickers_data():
 
 
 def process_market_data(tickers):
-    """Анализирует поступившие данные рынка на соответствие LONG-условиям"""
+    """Анализирует поступившие данные с учетом фильтра объема"""
     timestamp = int(datetime.now().timestamp())
 
     with data_lock:
@@ -222,7 +229,12 @@ def process_market_data(tickers):
                 price = float(ticker.get('lastPrice', 0))
                 oi = float(ticker.get('openInterest', 0))
                 price_24h_change = float(ticker.get('price24hPcnt', 0)) * 100
+                turnover_24h = float(ticker.get('turnover24h', 0))  # Оборот за 24ч в USDT
             except (ValueError, TypeError):
+                continue
+
+            # ФИЛЬТР 1: Минимальный оборот за 24 часа (от 5 000 000 USDT)
+            if turnover_24h < MIN_24H_VOLUME_USDT:
                 continue
 
             if price <= 0 or oi <= 0:
@@ -253,15 +265,18 @@ def process_market_data(tickers):
 
                     # Проверка Кулдауна
                     if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
+                        volume_in_m = turnover_24h / 1_000_000
+
                         msg = (
                             f"🚀 <b>{symbol}</b>: Памп / Набор ЛОНГА!\n\n"
                             f"📈 <b>Рост от Low (5м):</b> <code>+{price_pump:.2f}%</code>\n"
                             f"📈 <b>Рост ОИ от Low (5м):</b> <code>+{oi_growth:.2f}%</code>\n"
+                            f"💵 <b>Оборот 24h:</b> <code>${volume_in_m:.2f}M</code>\n"
                             f"📊 <b>Тренд 24h:</b> <code>{price_24h_change:.2f}%</code>\n"
                             f"⏱ <b>Окно анализа:</b> 5 мин."
                         )
 
-                        # Отправка уведомлений всем активным юзерам
+                        # Отправка всем активным юзерам
                         for chat_id in list(users.keys()):
                             threading.Thread(
                                 target=send_telegram_notification,
@@ -274,16 +289,19 @@ def process_market_data(tickers):
 
 # ==================== MAIN LOOP ====================
 def main():
-    print("=== Запуск REST API Мониторинга LONG (Рост цены + Рост ОИ) ===")
+    print(f"=== Запуск REST API Мониторинга LONG ===")
+    print(f"• Порог роста цены: +{LONG_PRICE_PUMP_THRESHOLD}%")
+    print(f"• Порог роста ОИ: +{LONG_MIN_OI_GROWTH_PCT}%")
+    print(f"• Минимальный объем 24h: ${MIN_24H_VOLUME_USDT / 1_000_000:.1f}M USDT\n")
 
-    # Запускаем фоновые сервисы Telegram
+    # Запуск фоновых сервисов Telegram
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
 
-    # Главный цикл опроса Bybit REST API
+    # Главный цикл опроса
     while True:
         start_time = time.time()
-        
+
         tickers = fetch_tickers_data()
         if tickers:
             process_market_data(tickers)
