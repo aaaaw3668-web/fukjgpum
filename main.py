@@ -15,7 +15,8 @@ if not TELEGRAM_BOT_TOKEN:
 
 # --- Настройки условия сигнала ---
 LONG_PRICE_PUMP_THRESHOLD = 0.5   # Рост цены от Low за 5 мин (в %)
-LONG_MIN_OI_GROWTH_PCT = 1.2      # Рост ОИ от Low за 5 мин (в %)
+LONG_MIN_OI_GROWTH_PCT = 0.5      # Рост ОИ от Low за 5 мин (в %)
+MAX_24H_TREND_PCT = 5.0           # Верхний лимит 24h тренда (в %). Выше 5% сигналы не отправляются.
 
 # --- Параметры опроса API и контроля ---
 TIME_WINDOW = 60 * 3              # Окно анализа: 5 минут (300 сек)
@@ -247,8 +248,8 @@ def process_market_data(tickers):
                 price_pump = calculate_change(min_price, price)
                 oi_growth = calculate_change(min_oi, oi)
 
-                # Главная логика: РОСТ ЦЕНЫ + РОСТ ОИ
-                if price_pump >= LONG_PRICE_PUMP_THRESHOLD and oi_growth >= LONG_MIN_OI_GROWTH_PCT:
+                # Главная логика: РОСТ ЦЕНЫ + РОСТ ОИ + ТРЕНД 24h НЕ ПРЕВЫШАЕТ 5%
+                if price_pump >= LONG_PRICE_PUMP_THRESHOLD and oi_growth >= LONG_MIN_OI_GROWTH_PCT and price_24h_change <= MAX_24H_TREND_PCT:
                     last_time = last_alert_time.get(symbol, 0)
 
                     # Проверка Кулдауна
