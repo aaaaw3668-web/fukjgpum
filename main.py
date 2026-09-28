@@ -21,6 +21,9 @@ SHORT_MIN_OI_GROWTH_PCT = 0.5      # Рост ОИ от Low за 5 мин (в %)
 MIN_24H_TREND_PCT = -10          # Нижняя граница тренда (не ниже -5%)
 MAX_24H_TREND_PCT = -3           # Верхняя граница тренда (не выше 0%)
 
+# --- Фильтр по суточному объему (в USDT) ---
+MIN_24H_VOLUME_USDT = 1_000_000   # Минимальный объем за 24 часа (1 млн $)
+
 # --- Черный список традиционных активов (Акции, ETF, CFD на Bybit) ---
 STOCKS_TICKERS = [
     # Финансы и Банки
@@ -251,10 +254,15 @@ def process_market_data(tickers):
                 price = float(ticker.get('lastPrice', 0))
                 oi = float(ticker.get('openInterest', 0))
                 price_24h_change = float(ticker.get('price24hPcnt', 0)) * 100
+                volume_24h = float(ticker.get('turnover24h', 0))
             except (ValueError, TypeError):
                 continue
 
             if price <= 0 or oi <= 0:
+                continue
+
+            # Проверка минимального суточного объема (1 млн $)
+            if volume_24h < MIN_24H_VOLUME_USDT:
                 continue
 
             if symbol not in historical_data:
@@ -290,6 +298,7 @@ def process_market_data(tickers):
                             f"📉 <b>Падение от High (5м):</b> <code>{price_dump:.2f}%</code>\n"
                             f"📈 <b>Рост ОИ от Low (5м):</b> <code>+{oi_growth:.2f}%</code>\n"
                             f"📊 <b>Тренд 24h:</b> <code>{price_24h_change:.2f}%</code>\n"
+                            f"💵 <b>Объем 24h:</b> <code>${volume_24h/1_000_000:.2f}M</code>\n"
                             f"⏱ <b>Окно анализа:</b> 5 мин."
                         )
 
