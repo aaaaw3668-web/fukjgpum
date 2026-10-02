@@ -17,46 +17,36 @@ if not TELEGRAM_BOT_TOKEN:
 SHORT_PRICE_DUMP_THRESHOLD = -0.5  # Падение цены от High за 5 мин (в %)
 SHORT_OI_DROP_THRESHOLD = -0.5     # Падение ОИ от High за 5 мин (в %)
 
-# --- Настройки диапазона 24h тренда (ТОЛЬКО МИНУСОВОЙ от 0% до -5%) ---
-MIN_24H_TREND_PCT = -3          # Нижняя граница тренда (не ниже -5%)
-MAX_24H_TREND_PCT = 0           # Верхняя граница тренда (не выше 0%)
+# --- Настройки диапазона тренда (Относительно UTC 00:00 или 24h) ---
+MIN_24H_TREND_PCT = -10.0          # Нижняя граница тренда (например, до -10%)
+MAX_24H_TREND_PCT = 0.0            # Верхняя граница тренда (не выше 0%)
 
 # --- Фильтр по суточному объему (в USDT) ---
-MIN_24H_VOLUME_USDT = 10_000_000   # Минимальный объем за 24 часа (1 млн $)
+MIN_24H_VOLUME_USDT = 10_000_000   # Минимальный объем за 24 часа (10 млн $)
 
 # --- Черный список традиционных активов (Акции, ETF, CFD на Bybit) ---
 STOCKS_TICKERS = [
-    # Финансы и Банки
     'MTB', 'COF', 'KKR', 'TFC', 'USB', 'FITB', 'RF', 'BEN', 'MS', 'PGR', 'AFG', 'TROW', 'CIM', 'MFA', 'SOFI', 'UPST', 'INTU', 'HDB', 'BBD',
-    # Технологии, Полупроводники и Софт
     'NVDA', 'AAPL', 'MSFT', 'GOOG', 'AMZN', 'META', 'TSLA', 'AMD', 'ADBE', 'MRVL', 'QCOM', 'SNPS', 'CRWD', 'DDOG', 'TXN', 'FTNT', 'OKTA', 'TWLO', 'BOX', 'JBL', 'HPE', 'DELL', 'NTAP', 'CDNS', 'SMCI', 'ARM', 'NBIS', 'SONY', 'BB', 'SKHY', 'AXTI', 'QNT', 'CBRS',
-    # Потребительский сектор и Ритейл
     'COST', 'WMT', 'YUM', 'YUMC', 'WEN', 'KHC', 'MO', 'ULTA', 'ROST', 'DLTR', 'BBWI', 'MAT', 'DKNG', 'RCL', 'LYFT', 'GRAB', 'MELI', 'BMBL', 'BYND', 'SIG', 'HTHT',
-    # Здравоохранение и Биотех
     'MRK', 'ABT', 'BSX', 'DHR', 'VRTX', 'REGN', 'AMGN', 'GILD', 'INCY', 'ILMN', 'HCA', 'MCK', 'CAH', 'MOH',
-    # Промышленность, Энергия и Сырье
     'GEV', 'HON', 'UPS', 'DAL', 'PCAR', 'IR', 'ITW', 'SWK', 'GNRC', 'NOC', 'WM', 'RSG', 'VMC', 'SHW', 'IP', 'XEL', 'SRE', 'PEG', 'PPL', 'OXY', 'CTRA', 'APA', 'LYB', 'EMN', 'WPM', 'NEM', 'FCEL', 'FLNC',
-    # Медиа, Телеком и Прочее
     'NFLX', 'TMUS', 'SPGI', 'ACN', 'BKNG', 'TRV', 'MET', 'LPL', 'NWS', 'FOX', 'RBLX', 'ROKU', 'SNAP', 'PENN', 'LAUR', 'DXC', 'SPCE', 'RKLB', 'EC', 'ICL', 'LBTYK', 'TME',
-    # ETF
     'SPY', 'QQQ', 'IWM', 'URNM', 'UVXY', 'SQQQ', 'SOXL', 'KORU', 'DRAM', 'PSA'
 ]
 
-# Создаем множество для быстрой проверки (включая чистый символ и символ + USDT)
 EXCLUDED_STOCKS = set(STOCKS_TICKERS) | {f"{t}USDT" for t in STOCKS_TICKERS}
 
 # --- Параметры опроса API и контроля ---
-TIME_WINDOW = 60 * 3              # Окно анализа: 5 минут (300 сек)
+TIME_WINDOW = 60 * 5              # Окно анализа: 5 минут (300 сек)
 POLL_INTERVAL = 10                # Частота запросов к API Bybit (раз в 10 секунд)
 COOLDOWN_MINUTES = 10             # Пауза между алертами по одной монете
 DAILY_ALERT_LIMIT = 100           # Суточный лимит алертов на монету
 
-# HTTP сессия с повторными попытками при сбоях сети
 session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
 session.mount('https://', adapter)
 
-# База пользователей в памяти
 users = {
     '5296533274': {
         'active': True,
@@ -64,15 +54,13 @@ users = {
     }
 }
 
-# Хранилище свеч/истории
-historical_data = {}              # { 'BTCUSDT': { 'price': [...], 'oi': [...] } }
-last_alert_time = {}              # { 'BTCUSDT': timestamp }
+historical_data = {}
+last_alert_time = {}
 data_lock = threading.Lock()
 
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def get_ye_time():
-    """Текущее время по Уфимскому часовому поясу (UTC+5)"""
     return datetime.now(timezone.utc) + timedelta(hours=5)
 
 
@@ -104,8 +92,8 @@ def calculate_change(old, new):
 def generate_links(symbol):
     encoded_symbol = urllib.parse.quote(symbol)
     return {
-        'coinglass': f"https://www.coinglass.com/tv/Binance_{encoded_symbol}",
-        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{encoded_symbol}",
+        'coinglass': f"https://www.coinglass.com/tv/Bybit_{encoded_symbol}",
+        'tradingview': f"https://www.tradingview.com/chart/?symbol=BYBIT%3A{encoded_symbol}.P",
         'binance': f"https://www.binance.com/ru/trade/{encoded_symbol}",
         'bybit': f"https://www.bybit.com/trade/usdt/{encoded_symbol}"
     }
@@ -142,7 +130,7 @@ def send_telegram_notification(chat_id, message, symbol):
         'chat_id': chat_id,
         'text': message_with_links,
         'parse_mode': 'HTML',
-        'disable_web_page_preview': False
+        'disable_web_page_preview': True
     }
     try:
         response = session.post(url, json=payload, timeout=10)
@@ -155,7 +143,6 @@ def send_telegram_notification(chat_id, message, symbol):
 
 
 def handle_telegram_updates():
-    """Простой Long Polling для команд /start и /stats"""
     last_update_id = 0
     while True:
         try:
@@ -179,7 +166,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': f"✅ <b>Бот мониторинга SHORT (Крипта: Падение цены + Падение ОИ) запущен!</b>",
+                            'text': f"✅ <b>Бот мониторинга SHORT запущен!</b>",
                             'parse_mode': 'HTML'
                         }
                         session.post(url_send, json=payload)
@@ -196,12 +183,11 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         session.post(url_send, json={'chat_id': chat_id, 'text': stats_text, 'parse_mode': 'HTML'})
             time.sleep(2)
-        except Exception as e:
+        except Exception:
             time.sleep(5)
 
 
 def check_and_reset_at_midnight():
-    """Сброс суточных лимитов в 05:00 по Уфе"""
     now = get_ye_time()
     reset_time = now.replace(hour=5, minute=0, second=0, microsecond=0)
     if now >= reset_time:
@@ -213,7 +199,7 @@ def check_and_reset_at_midnight():
             if now >= reset_time:
                 for chat_id in users:
                     users[chat_id]['alert_counts'] = {}
-                print("🔄 Суточные лимиты алертов сброшены.")
+                print("🔄 Суточные лимиты сброшены.")
                 reset_time += timedelta(days=1)
             time.sleep(30)
         except Exception:
@@ -222,7 +208,6 @@ def check_and_reset_at_midnight():
 
 # ==================== РАБОТА С REST API BYBIT ====================
 def fetch_tickers_data():
-    """Получает текущие цены, 24h изменение и Открытый Интерес по всем монетам через один REST-запрос"""
     url = "https://api.bybit.com/v5/market/tickers"
     params = {"category": "linear"}
     try:
@@ -237,7 +222,6 @@ def fetch_tickers_data():
 
 
 def process_market_data(tickers):
-    """Анализирует поступившие данные рынка на соответствие SHORT-условиям"""
     timestamp = int(datetime.now().timestamp())
 
     with data_lock:
@@ -246,24 +230,26 @@ def process_market_data(tickers):
             if not symbol.endswith('USDT'):
                 continue
 
-            # Исключаем акции, ETF и CFD продукты
             if symbol in EXCLUDED_STOCKS:
                 continue
 
             try:
                 price = float(ticker.get('lastPrice', 0))
                 oi = float(ticker.get('openInterest', 0))
-                price_24h_change = float(ticker.get('price24hPcnt', 0)) * 100
+                prev_price_24h = float(ticker.get('prevPrice24h', 0))
                 volume_24h = float(ticker.get('turnover24h', 0))
             except (ValueError, TypeError):
                 continue
 
-            if price <= 0 or oi <= 0:
+            if price <= 0 or oi <= 0 or prev_price_24h <= 0:
                 continue
 
-            # Проверка минимального суточного объема (1 млн $)
+            # Фильтр минимального объема за 24 часа
             if volume_24h < MIN_24H_VOLUME_USDT:
                 continue
+
+            # Точный расчет изменения цены за 24 часа в процентах
+            trend_24h_pct = calculate_change(prev_price_24h, price)
 
             if symbol not in historical_data:
                 historical_data[symbol] = {'price': [], 'oi': []}
@@ -272,11 +258,10 @@ def process_market_data(tickers):
             data['price'].append({'value': price, 'timestamp': timestamp})
             data['oi'].append({'value': oi, 'timestamp': timestamp})
 
-            # Очищаем данные старее 5 минут (TIME_WINDOW)
+            # Очищаем данные за пределами временного окна анализа (5 минут)
             data['price'] = [x for x in data['price'] if timestamp - x['timestamp'] <= TIME_WINDOW]
             data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
-            # Проверяем условие сигнала (нужно минимум 2 точки данных)
             if len(data['price']) > 1 and len(data['oi']) > 1:
                 max_price = max(x['value'] for x in data['price'])
                 max_oi = max(x['value'] for x in data['oi'])
@@ -284,25 +269,23 @@ def process_market_data(tickers):
                 price_dump = calculate_change(max_price, price)
                 oi_drop = calculate_change(max_oi, oi)
 
-                # Главная логика: ПАДЕНИЕ ЦЕНЫ + ПАДЕНИЕ ОИ + ТРЕНД 24h ОТ -5% ДО 0%
+                # Главная логика проверки сигналов
                 if (price_dump <= SHORT_PRICE_DUMP_THRESHOLD and 
                     oi_drop <= SHORT_OI_DROP_THRESHOLD and 
-                    MIN_24H_TREND_PCT <= price_24h_change <= MAX_24H_TREND_PCT):
+                    MIN_24H_TREND_PCT <= trend_24h_pct <= MAX_24H_TREND_PCT):
                     
                     last_time = last_alert_time.get(symbol, 0)
 
-                    # Проверка Кулдауна
                     if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
                         msg = (
                             f"🔻 <b>{symbol}</b>: Дамп / Падение ОИ!\n\n"
                             f"📉 <b>Падение цены от High (5м):</b> <code>{price_dump:.2f}%</code>\n"
                             f"📉 <b>Падение ОИ от High (5м):</b> <code>{oi_drop:.2f}%</code>\n"
-                            f"📊 <b>Тренд 24h:</b> <code>{price_24h_change:.2f}%</code>\n"
+                            f"📊 <b>Тренд 24h (Bybit):</b> <code>{trend_24h_pct:.2f}%</code>\n"
                             f"💵 <b>Объем 24h:</b> <code>${volume_24h/1_000_000:.2f}M</code>\n"
                             f"⏱ <b>Окно анализа:</b> 5 мин."
                         )
 
-                        # Отправка уведомлений всем активным юзерам
                         for chat_id in list(users.keys()):
                             threading.Thread(
                                 target=send_telegram_notification,
@@ -317,11 +300,9 @@ def process_market_data(tickers):
 def main():
     print("=== Запуск REST API Мониторинга SHORT (Падение цены + Падение ОИ) ===")
 
-    # Запускаем фоновые сервисы Telegram
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
 
-    # Главный цикл опроса Bybit REST API
     while True:
         start_time = time.time()
         
@@ -329,7 +310,6 @@ def main():
         if tickers:
             process_market_data(tickers)
 
-        # Вычисляем время паузы до следующего опроса
         elapsed = time.time() - start_time
         sleep_time = max(1, POLL_INTERVAL - elapsed)
         time.sleep(sleep_time)
