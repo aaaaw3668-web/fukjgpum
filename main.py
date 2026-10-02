@@ -14,15 +14,16 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # --- Настройки условия сигнала ---
-SHORT_PRICE_DUMP_THRESHOLD = -0.5  # Падение цены от High за 5 мин (в %)
-SHORT_OI_DROP_THRESHOLD = -0.5     # Падение ОИ от High за 5 мин (в %)
+SHORT_PRICE_DUMP_THRESHOLD = -0.5      # Минимальное падение цены от High за 5 мин (от -0.5%)
+MAX_SHORT_PRICE_DUMP_THRESHOLD = -1.0  # Максимальное падение цены от High за 5 мин (до -1.0%)
+SHORT_OI_DROP_THRESHOLD = -0.5         # Падение ОИ от High за 5 мин (в %)
 
 # --- Настройки диапазона тренда (Относительно UTC 00:00 или 24h) ---
 MIN_24H_TREND_PCT = -3          # Нижняя граница тренда (например, до -10%)
 MAX_24H_TREND_PCT = 0.0            # Верхняя граница тренда (не выше 0%)
 
 # --- Фильтр по суточному объему (в USDT) ---
-MIN_24H_VOLUME_USDT = 10_000_000   # Минимальный объем за 24 часа (10 млн $)
+MIN_24H_VOLUME_USDT = 10_000   # Минимальный объем за 24 часа (10 млн $)
 
 # --- Черный список традиционных активов (Акции, ETF, CFD на Bybit) ---
 STOCKS_TICKERS = [
@@ -269,8 +270,8 @@ def process_market_data(tickers):
                 price_dump = calculate_change(max_price, price)
                 oi_drop = calculate_change(max_oi, oi)
 
-                # Главная логика проверки сигналов
-                if (price_dump <= SHORT_PRICE_DUMP_THRESHOLD and 
+                # Главная логика проверки сигналов: Падение от -0.5% до -1.0%
+                if (MAX_SHORT_PRICE_DUMP_THRESHOLD <= price_dump <= SHORT_PRICE_DUMP_THRESHOLD and 
                     oi_drop <= SHORT_OI_DROP_THRESHOLD and 
                     MIN_24H_TREND_PCT <= trend_24h_pct <= MAX_24H_TREND_PCT):
                     
