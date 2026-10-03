@@ -14,9 +14,9 @@ if not TELEGRAM_BOT_TOKEN:
     exit(1)
 
 # --- Настройки условия сигнала ---
-MIN_PRICE_PUMP_THRESHOLD = 2.0       # Минимальный рост цены от Low за 5 мин (от +0.5%)
+MIN_PRICE_PUMP_THRESHOLD = 0.5       # Минимальный рост цены от Low за 5 мин (от +0.5%)
 MAX_PRICE_PUMP_THRESHOLD = 5.0       # Максимальный рост цены от Low за 5 мин (до +1.0%)
-SHORT_OI_DROP_THRESHOLD = -1       # Падение ОИ от High за 5 мин (в %, т.е. <= -0.5%)
+SHORT_OI_DROP_THRESHOLD = -0.5       # Падение ОИ от High за 5 мин (в %, т.е. <= -0.5%)
 
 # --- Настройки диапазона тренда (24h) ---
 MIN_24H_TREND_PCT = -10              # Нижняя граница суточного тренда
