@@ -7,23 +7,23 @@ import urllib.parse
 from datetime import datetime, timedelta, timezone
 import requests
 
-# ==================== НАСТРОЙКИ (РОСТ ЦЕНЫ + ПАДЕНИЕ ОИ) ====================
+# ==================== НАСТРОЙКИ (ПАДЕНИЕ ЦЕНЫ + ПАДЕНИЕ ОИ) ====================
 TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN', '')
 if not TELEGRAM_BOT_TOKEN:
     print("✗ Ошибка: TELEGRAM_BOT_TOKEN не найден в переменных окружения!")
     exit(1)
 
 # --- Настройки условия сигнала ---
-MIN_PRICE_PUMP_THRESHOLD = 2.0       # Минимальный рост цены от Low за 5 мин (от +0.5%)
-MAX_PRICE_PUMP_THRESHOLD = 5.0       # Максимальный рост цены от Low за 5 мин (до +1.0%)
+MIN_PRICE_DROP_THRESHOLD = -1.0      # Падение цены от High за 5 мин (от -2.0%)
+MAX_PRICE_DROP_THRESHOLD = -7.0      # Максимальное падение цены от High за 5 мин (до -5.0%)
 SHORT_OI_DROP_THRESHOLD = -1.0       # Падение ОИ от High за 5 мин (в %, т.е. <= -0.5%)
 
 # --- Настройки диапазона тренда (24h) ---
 MIN_24H_TREND_PCT = -10              # Нижняя граница суточного тренда
-MAX_24H_TREND_PCT = 10               # Верхняя граница суточного тренда
+MAX_24H_TREND_PCT = 3               # Верхняя граница суточного тренда
 
 # --- Фильтр по суточному объему (в USDT) ---
-MIN_24H_VOLUME_USDT = 10_000      # Минимальный объем за 24 часа ($10 млн)
+MIN_24H_VOLUME_USDT = 5_000_000      # Минимальный объем за 24 часа ($10 млн)
 
 # --- Черный список традиционных активов (Акции, ETF, CFD на Bybit) ---
 STOCKS_TICKERS = [
@@ -136,7 +136,7 @@ def send_telegram_notification(chat_id, message, symbol):
     try:
         response = session.post(url, json=payload, timeout=10)
         response.raise_for_status()
-        print(f"✓ Рост + Падение ОИ сигнал по {symbol} отправлен пользователю {chat_id}")
+        print(f"✓ Падение цены + Падение ОИ сигнал по {symbol} отправлен пользователю {chat_id}")
         return True
     except Exception as e:
         print(f"✗ Ошибка отправки в TG: {repr(e)}")
@@ -167,7 +167,7 @@ def handle_telegram_updates():
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         payload = {
                             'chat_id': chat_id,
-                            'text': f"✅ <b>Бот мониторинга (Рост цены + Падение ОИ) запущен!</b>",
+                            'text': f"✅ <b>Бот мониторинга (Падение цены + Падение ОИ) запущен!</b>",
                             'parse_mode': 'HTML'
                         }
                         session.post(url_send, json=payload)
@@ -264,14 +264,14 @@ def process_market_data(tickers):
             data['oi'] = [x for x in data['oi'] if timestamp - x['timestamp'] <= TIME_WINDOW]
 
             if len(data['price']) > 1 and len(data['oi']) > 1:
-                min_price = min(x['value'] for x in data['price'])  # Локальный минимум цены
+                max_price = max(x['value'] for x in data['price'])  # Локальный максимум цены
                 max_oi = max(x['value'] for x in data['oi'])        # Локальный максимум ОИ
 
-                price_pump = calculate_change(min_price, price)     # Рост цены от Low (положительный %)
+                price_drop = calculate_change(max_price, price)     # Падение цены от High (отрицательный %)
                 oi_drop = calculate_change(max_oi, oi)              # Падение ОИ от High (отрицательный %)
 
-                # Главное условие: Рост цены (+0.5% .. +1.0%) И Падение ОИ (<= -0.5%)
-                if (MIN_PRICE_PUMP_THRESHOLD <= price_pump <= MAX_PRICE_PUMP_THRESHOLD and 
+                # Главное условие: Падение цены (от -2.0% до -5.0%) И Падение ОИ (<= -1.0%)
+                if (MAX_PRICE_DROP_THRESHOLD <= price_drop <= MIN_PRICE_DROP_THRESHOLD and 
                     oi_drop <= SHORT_OI_DROP_THRESHOLD and 
                     MIN_24H_TREND_PCT <= trend_24h_pct <= MAX_24H_TREND_PCT):
                     
@@ -279,8 +279,8 @@ def process_market_data(tickers):
 
                     if timestamp - last_time >= (COOLDOWN_MINUTES * 60):
                         msg = (
-                            f"🚀 <b>{symbol}</b>: Памп цены / Сброс ОИ!\n\n"
-                            f"📈 <b>Рост цены от Low (5м):</b> <code>+{price_pump:.2f}%</code>\n"
+                            f"📉 <b>{symbol}</b>: Слив цены / Сброс ОИ!\n\n"
+                            f"📉 <b>Падение цены от High (5м):</b> <code>{price_drop:.2f}%</code>\n"
                             f"📉 <b>Падение ОИ от High (5м):</b> <code>{oi_drop:.2f}%</code>\n"
                             f"📊 <b>Тренд 24h (Bybit):</b> <code>{trend_24h_pct:.2f}%</code>\n"
                             f"💵 <b>Объем 24h:</b> <code>${volume_24h/1_000_000:.2f}M</code>\n"
@@ -299,7 +299,7 @@ def process_market_data(tickers):
 
 # ==================== MAIN LOOP ====================
 def main():
-    print("=== Запуск REST API Мониторинга (Рост цены + Падение ОИ) ===")
+    print("=== Запуск REST API Мониторинга (Падение цены + Падение ОИ) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
