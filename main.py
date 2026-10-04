@@ -22,7 +22,10 @@ DEFAULT_MIN_24H_TREND = -10.0      # Нижняя граница суточно�
 DEFAULT_MAX_24H_TREND = 3.0        # Верхняя граница суточного тренда
 
 # --- Фильтр по суточному объему (в USDT) по умолчанию ---
-DEFAULT_MIN_24H_VOLUME_USDT = 10_000  # $10 млн ($10,000,000)
+DEFAULT_MIN_24H_VOLUME_USDT = 10_000_000.0  # $10 млн ($10,000,000)
+
+# --- Фильтр отрицательного фандинга по умолчанию ---
+DEFAULT_FUNDING_FILTER_ONLY_NEGATIVE = True  # True: только < 0%, False: проверка отключена
 
 # --- Черный список традиционных активов (Акции, ETF, CFD на Bybit) ---
 STOCKS_TICKERS = [
@@ -47,7 +50,7 @@ session = requests.Session()
 adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
 session.mount('https://', adapter)
 
-# Структура пользователя теперь хранит его кастомные настройки
+# Структура пользователя хранит настройки
 users = {
     '5296533274': {
         'active': True,
@@ -57,7 +60,8 @@ users = {
             'max_price_drop': DEFAULT_MAX_PRICE_DROP,
             'min_24h_trend': DEFAULT_MIN_24H_TREND,
             'max_24h_trend': DEFAULT_MAX_24H_TREND,
-            'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT
+            'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT,
+            'only_negative_funding': DEFAULT_FUNDING_FILTER_ONLY_NEGATIVE
         }
     }
 }
@@ -79,7 +83,8 @@ def get_user_settings(chat_id):
             'max_price_drop': DEFAULT_MAX_PRICE_DROP,
             'min_24h_trend': DEFAULT_MIN_24H_TREND,
             'max_24h_trend': DEFAULT_MAX_24H_TREND,
-            'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT
+            'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT,
+            'only_negative_funding': DEFAULT_FUNDING_FILTER_ONLY_NEGATIVE
         }
     if 'settings' not in users[chat_id]:
         users[chat_id]['settings'] = {
@@ -87,7 +92,8 @@ def get_user_settings(chat_id):
             'max_price_drop': DEFAULT_MAX_PRICE_DROP,
             'min_24h_trend': DEFAULT_MIN_24H_TREND,
             'max_24h_trend': DEFAULT_MAX_24H_TREND,
-            'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT
+            'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT,
+            'only_negative_funding': DEFAULT_FUNDING_FILTER_ONLY_NEGATIVE
         }
     return users[chat_id]['settings']
 
@@ -200,14 +206,15 @@ def handle_telegram_updates():
                                 'max_price_drop': DEFAULT_MAX_PRICE_DROP,
                                 'min_24h_trend': DEFAULT_MIN_24H_TREND,
                                 'max_24h_trend': DEFAULT_MAX_24H_TREND,
-                                'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT
+                                'min_24h_volume': DEFAULT_MIN_24H_VOLUME_USDT,
+                                'only_negative_funding': DEFAULT_FUNDING_FILTER_ONLY_NEGATIVE
                             }
                         }
 
                     if text_lower == '/start':
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         help_text = (
-                            f"✅ <b>Бот мониторинга (Падение цены + Тренд) запущен!</b>\n\n"
+                            f"✅ <b>Бот мониторинга (Падение цены + Тренд + Фандинг) запущен!</b>\n\n"
                             f"⚙️ <b>Команды управления:</b>\n"
                             f"• /settings — посмотреть текущие настройки\n"
                             f"• /set <code>[параметр] [значение]</code> — изменить настройку\n"
@@ -217,8 +224,9 @@ def handle_telegram_updates():
                             f"• <code>max_drop</code> — нижняя граница падения (напр. -7.0)\n"
                             f"• <code>vol</code> — мин. объем за 24ч в млн $ (напр. 10 или 0.5)\n"
                             f"• <code>min_trend</code> — мин. тренд 24h в % (напр. -10)\n"
-                            f"• <code>max_trend</code> — макс. тренд 24h в % (напр. 3)\n\n"
-                            f"<i>Пример использования:</i> <code>/set min_drop -1.5</code> или <code>/set vol 5</code>"
+                            f"• <code>max_trend</code> — макс. тренд 24h в % (напр. 3)\n"
+                            f"• <code>funding</code> — только отрицательный фандинг (<code>on</code> / <code>off</code>)\n\n"
+                            f"<i>Пример:</i> <code>/set funding on</code> или <code>/set funding off</code>"
                         )
                         payload = {'chat_id': chat_id, 'text': help_text, 'parse_mode': 'HTML'}
                         session.post(url_send, json=payload)
@@ -226,11 +234,13 @@ def handle_telegram_updates():
                     elif text_lower == '/settings':
                         st = get_user_settings(chat_id)
                         vol_m = st['min_24h_volume'] / 1_000_000
+                        funding_status = "🔴 Только отрицательный (< 0%)" if st['only_negative_funding'] else "⚪ Любой фандинг (выкл)"
                         settings_text = (
                             f"⚙️ <b>Текущие настройки для сигнала:</b>\n\n"
                             f"📉 <b>Падение цены (5м):</b> от <code>{st['min_price_drop']}%</code> до <code>{st['max_price_drop']}%</code>\n"
                             f"📊 <b>Тренд 24h:</b> от <code>{st['min_24h_trend']}%</code> до <code>{st['max_24h_trend']}%</code>\n"
-                            f"💵 <b>Мин. объем 24h:</b> <code>${vol_m:.2f}M</code> (<code>{st['min_24h_volume']:,.0f} USDT</code>)"
+                            f"💵 <b>Мин. объем 24h:</b> <code>${vol_m:.2f}M</code>\n"
+                            f"💸 <b>Фильтр фандинга:</b> {funding_status}"
                         )
                         url_send = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
                         session.post(url_send, json={'chat_id': chat_id, 'text': settings_text, 'parse_mode': 'HTML'})
@@ -242,35 +252,45 @@ def handle_telegram_updates():
                         
                         if len(parts) == 3:
                             param = parts[1].lower()
-                            try:
-                                val = float(parts[2])
-                                st = get_user_settings(chat_id)
-                                reply = ""
+                            val_str = parts[2].lower()
+                            st = get_user_settings(chat_id)
+                            reply = ""
 
-                                if param in ['min_drop', 'min_price_drop']:
-                                    st['min_price_drop'] = val
-                                    reply = f"✅ Верхняя граница падения установлена на: <code>{val}%</code>"
-                                elif param in ['max_drop', 'max_price_drop']:
-                                    st['max_price_drop'] = val
-                                    reply = f"✅ Нижняя граница падения установлена на: <code>{val}%</code>"
-                                elif param in ['vol', 'volume']:
-                                    # Ввод в миллионах (например: 10 = 10,000,000 USDT)
-                                    st['min_24h_volume'] = val * 1_000_000
-                                    reply = f"✅ Мин. объем 24ч установлен на: <code>${val}M</code> USDT"
-                                elif param in ['min_trend']:
-                                    st['min_24h_trend'] = val
-                                    reply = f"✅ Нижняя граница тренда 24h установлена на: <code>{val}%</code>"
-                                elif param in ['max_trend']:
-                                    st['max_24h_trend'] = val
-                                    reply = f"✅ Верхняя граница тренда 24h установлена на: <code>{val}%</code>"
+                            if param in ['funding', 'funding_filter']:
+                                if val_str in ['on', '1', 'true', 'yes', 'вкл']:
+                                    st['only_negative_funding'] = True
+                                    reply = "✅ Фильтр включен: алерты будут приходить <b>только с отрицательным фандингом (< 0%)</b>."
+                                elif val_str in ['off', '0', 'false', 'no', 'выкл']:
+                                    st['only_negative_funding'] = False
+                                    reply = "⚪ Фильтр фандинга выключен: алерты приходят при любом фандинге."
                                 else:
-                                    reply = "❌ Неизвестный параметр. Доступны: <code>min_drop</code>, <code>max_drop</code>, <code>vol</code>, <code>min_trend</code>, <code>max_trend</code>"
+                                    reply = "❌ Для фандинга используйте: <code>/set funding on</code> или <code>/set funding off</code>"
+                            else:
+                                try:
+                                    val = float(parts[2])
+                                    if param in ['min_drop', 'min_price_drop']:
+                                        st['min_price_drop'] = val
+                                        reply = f"✅ Верхняя граница падения установлена на: <code>{val}%</code>"
+                                    elif param in ['max_drop', 'max_price_drop']:
+                                        st['max_price_drop'] = val
+                                        reply = f"✅ Нижняя граница падения установлена на: <code>{val}%</code>"
+                                    elif param in ['vol', 'volume']:
+                                        st['min_24h_volume'] = val * 1_000_000
+                                        reply = f"✅ Мин. объем 24ч установлен на: <code>${val}M</code> USDT"
+                                    elif param in ['min_trend']:
+                                        st['min_24h_trend'] = val
+                                        reply = f"✅ Нижняя граница тренда 24h установлена на: <code>{val}%</code>"
+                                    elif param in ['max_trend']:
+                                        st['max_24h_trend'] = val
+                                        reply = f"✅ Верхняя граница тренда 24h установлена на: <code>{val}%</code>"
+                                    else:
+                                        reply = "❌ Неизвестный параметр. Доступны: <code>min_drop</code>, <code>max_drop</code>, <code>vol</code>, <code>min_trend</code>, <code>max_trend</code>, <code>funding</code>"
+                                except ValueError:
+                                    reply = "❌ Значение должно быть числом или on/off!"
 
-                                session.post(url_send, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'HTML'})
-                            except ValueError:
-                                session.post(url_send, json={'chat_id': chat_id, 'text': "❌ Значение должно быть числом!", 'parse_mode': 'HTML'})
+                            session.post(url_send, json={'chat_id': chat_id, 'text': reply, 'parse_mode': 'HTML'})
                         else:
-                            session.post(url_send, json={'chat_id': chat_id, 'text': "❌ Неверный формат! Используйте: <code>/set [параметр] [значение]</code>\nПример: <code>/set vol 5</code>", 'parse_mode': 'HTML'})
+                            session.post(url_send, json={'chat_id': chat_id, 'text': "❌ Неверный формат! Используйте: <code>/set [параметр] [значение]</code>\nПример: <code>/set funding on</code>", 'parse_mode': 'HTML'})
 
                     elif text_lower == '/stats':
                         counts = users.get(chat_id, {}).get('alert_counts', {})
@@ -338,6 +358,8 @@ def process_market_data(tickers):
                 price = float(ticker.get('lastPrice', 0))
                 prev_price_24h = float(ticker.get('prevPrice24h', 0))
                 volume_24h = float(ticker.get('turnover24h', 0))
+                # Точный актуальный фандинг напрямую с биржи Bybit (перевод коэффициента в проценты)
+                funding_rate_pct = float(ticker.get('fundingRate', 0)) * 100
             except (ValueError, TypeError):
                 continue
 
@@ -366,17 +388,19 @@ def process_market_data(tickers):
                 for chat_id in list(users.keys()):
                     st = get_user_settings(chat_id)
 
-                    # 1. Фильтр по объему
+                    # 1. Фильтр фандинга (если включен — пропускаем монеты с положительным/нулевым фандингом)
+                    if st.get('only_negative_funding', True) and funding_rate_pct >= 0:
+                        continue
+
+                    # 2. Фильтр по объему
                     if volume_24h < st['min_24h_volume']:
                         continue
 
-                    # 2. Фильтр по суточному тренду
+                    # 3. Фильтр по суточному тренду
                     if not (st['min_24h_trend'] <= trend_24h_pct <= st['max_24h_trend']):
                         continue
 
-                    # 3. Условие падения цены от High (за 5 мин)
-                    # max_price_drop — например -7.0, min_price_drop — например -1.0
-                    # Должно выполняться: -7.0 <= price_drop <= -1.0
+                    # 4. Условие падения цены от High (за 5 мин)
                     min_d = min(st['min_price_drop'], st['max_price_drop'])
                     max_d = max(st['min_price_drop'], st['max_price_drop'])
 
@@ -385,6 +409,7 @@ def process_market_data(tickers):
                             msg = (
                                 f"📉 <b>{symbol}</b>: Слив цены!\n\n"
                                 f"📉 <b>Падение цены от High (5м):</b> <code>{price_drop:.2f}%</code>\n"
+                                f"💸 <b>Фандинг (Bybit):</b> <code>{funding_rate_pct:.4f}%</code>\n"
                                 f"📊 <b>Тренд 24h (Bybit):</b> <code>{trend_24h_pct:.2f}%</code>\n"
                                 f"💵 <b>Объем 24h:</b> <code>${volume_24h/1_000_000:.2f}M</code>\n"
                                 f"⏱ <b>Окно анализа:</b> 5 мин."
@@ -401,7 +426,7 @@ def process_market_data(tickers):
 
 # ==================== MAIN LOOP ====================
 def main():
-    print("=== Запуск REST API Мониторинга (Падение цены + Тренд) ===")
+    print("=== Запуск REST API Мониторинга (Падение цены + Тренд + Фандинг) ===")
 
     threading.Thread(target=handle_telegram_updates, daemon=True).start()
     threading.Thread(target=check_and_reset_at_midnight, daemon=True).start()
