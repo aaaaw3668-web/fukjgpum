@@ -1,10 +1,18 @@
-requests>=2.25.0
-websocket-client==1.6.4 
-pytz==2024.1
-Flask==3.1.0
-Werkzeug==3.1.3
-websockets
+# --- Основные зависимости бота ---
+python-telegram-bot>=20.0
+ccxt>=4.0.0
 aiohttp>=3.9.0
 python-dotenv>=1.0.0
-ccxt>=4.0.0
-python-telegram-bot>=20.0
+
+# --- SSL и Сеть ---
+certifi>=2024.0.0
+websockets
+
+# --- Веб-сервер и Хостинг (для Render/Railway/VPS) ---
+Flask==3.1.0
+Werkzeug==3.1.3
+gunicorn>=21.0.0
+
+# --- Вспомогательные ---
+pytz==2024.1
+
