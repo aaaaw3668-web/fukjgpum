@@ -26,8 +26,8 @@ CHECK_INTERVAL_SECONDS = 15    # Интервал между кругами ск
 # Комиссионные издержки
 CEX_TAKER_FEE = 0.001          # 0.1% комиссия MEXC
 DEX_SWAP_FEE = 0.003           # 0.3% комиссия DEX
-ESTIMATED_GAS_USD = 0.15       # Средний газ в L2/Solana ($0.15)
-ESTIMATED_WITHDRAW_FEE_USD = 0.50 # Комиссия за вывод с CEX
+ESTIMATED_GAS_USD = 0.05       # Средний газ в L2/Solana ($0.15)
+ESTIMATED_WITHDRAW_FEE_USD = 0.10 # Комиссия за вывод с CEX
 
 mexc = ccxt.mexc({'enableRateLimit': True})
 LAST_CHAT_ID = None
